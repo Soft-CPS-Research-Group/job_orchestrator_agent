@@ -18,6 +18,41 @@ def test_normalize_citylearn_configs_legacy_supports_buildings_selection():
     assert normalized["schema_overrides"]["signals"] == ["load", "pv"]
 
 
+def test_15_second_schema_template_uses_entity_bundles_and_time_columns():
+    schema = c._base_schema_template()
+    time_frame = c._build_time_columns(pd.date_range(start="2026-01-01T00:00:15Z", periods=1, freq="15s"))
+
+    assert schema["interface"] == "entity"
+    assert schema["ev_departure_within_tolerance"] == 0.05
+    assert schema["ev_departure_service_tolerance"] == 0.05
+    assert schema["observations"]["minutes"]["active"] is True
+    assert schema["observations"]["seconds"]["active"] is True
+    assert all(bundle["active"] is True for bundle in schema["observation_bundles"].values())
+    assert list(time_frame.columns) == ["month", "hour", "minutes", "seconds", "day_type", "daylight_savings_status"]
+    assert time_frame.iloc[0]["seconds"] == 15
+
+
+def test_extract_pricing_reads_nested_energy_tariff_values():
+    pricing = c._extract_pricing(
+        {
+            "energy_tariffs": {
+                "OMIE": {
+                    "energy_price": {
+                        "values": [0.10, 0.20, 0.30, 0.40],
+                    }
+                }
+            }
+        }
+    )
+
+    assert pricing == {
+        "electricity_pricing": 0.10,
+        "electricity_pricing_predicted_1": 0.20,
+        "electricity_pricing_predicted_2": 0.30,
+        "electricity_pricing_predicted_3": 0.40,
+    }
+
+
 def test_ev_policy_dict_by_charger_is_direct_mapping():
     index = pd.date_range(start="2026-01-01T01:00:00Z", periods=2, freq="60min")
     sessions = pd.DataFrame(
@@ -42,7 +77,7 @@ def test_ev_policy_dict_by_charger_is_direct_mapping():
         building_id="B1",
         charger_ids=["C1", "C2"],
         resampled_sessions=sessions,
-        period_minutes=60,
+        step_seconds=3600,
         defaults=c.DEFAULTS_TEMPLATE,
         warnings=warnings,
     )
@@ -73,7 +108,7 @@ def test_ev_policy_list_with_single_charger_maps_to_that_charger():
         building_id="B1",
         charger_ids=["C_ONLY"],
         resampled_sessions=sessions,
-        period_minutes=60,
+        step_seconds=3600,
         defaults=c.DEFAULTS_TEMPLATE,
         warnings=warnings,
     )
@@ -99,7 +134,7 @@ def test_ev_policy_list_with_multiple_chargers_disables_ev_for_building():
         building_id="B_ambiguous",
         charger_ids=["C1", "C2"],
         resampled_sessions=sessions,
-        period_minutes=60,
+        step_seconds=3600,
         defaults=c.DEFAULTS_TEMPLATE,
         warnings=warnings,
     )

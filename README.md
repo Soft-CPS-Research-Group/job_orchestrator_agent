@@ -34,7 +34,7 @@ Job clients use this service for:
 - `/job-resolved-config/{job_id}`
 - `/job-images/versions`
 - `/experiment-config*`
-- `/dataset`, `/datasets`, `/dataset/upload`, `/dataset/download/{name}`
+- `/dataset`, `/datasets`, `/datasets/generate`, `/dataset/upload`, `/dataset/download/{name}`
 - `/dataset/sites`, `/dataset/dates-available/{site_id}`
 - `/simulation-data/index`, `/simulation-data/file`
 

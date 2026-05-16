@@ -53,6 +53,7 @@ def test_job_orchestrator_exposes_expected_routes():
         "/experiment-configs",
         "/experiment-config/{file_name}",
         "/dataset",
+        "/datasets/generate",
         "/dataset/sites",
         "/dataset/dates-available/{site_id}",
         "/datasets",

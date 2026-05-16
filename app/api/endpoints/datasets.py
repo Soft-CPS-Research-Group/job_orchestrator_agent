@@ -11,10 +11,47 @@ async def create_dataset(
     citylearn_configs: dict = Body(...),
     description: Optional[str] = Body(""),
     period : Optional[int] = Body(60),
+    seconds_per_time_step: Optional[int] = Body(None),
     from_ts: Optional[str] = Body(None),
     until_ts: Optional[str] = Body(None)
 ):
-    return dataset_controller.create_dataset(name, site_id, citylearn_configs, description, period, from_ts, until_ts)
+    return dataset_controller.create_dataset(
+        name,
+        site_id,
+        citylearn_configs,
+        description,
+        60 if period is None else period,
+        from_ts,
+        until_ts,
+        seconds_per_time_step,
+    )
+
+
+@router.post("/datasets/generate")
+async def create_datasets_from_mongo(
+    name_prefix: Optional[str] = Body("auto"),
+    site_ids: Optional[list[str]] = Body(None),
+    citylearn_configs: Optional[dict] = Body(None),
+    description: Optional[str] = Body(""),
+    period: Optional[int] = Body(None),
+    seconds_per_time_step: Optional[int] = Body(None),
+    from_ts: Optional[str] = Body(None),
+    until_ts: Optional[str] = Body(None),
+    dry_run: Optional[bool] = Body(False),
+    continue_on_error: Optional[bool] = Body(True),
+):
+    return dataset_controller.create_datasets_from_mongo(
+        name_prefix or "auto",
+        site_ids,
+        citylearn_configs or {},
+        description or "",
+        period,
+        from_ts,
+        until_ts,
+        seconds_per_time_step,
+        bool(dry_run),
+        bool(continue_on_error),
+    )
 
 
 @router.get("/dataset/sites")

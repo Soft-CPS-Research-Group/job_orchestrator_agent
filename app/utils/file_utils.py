@@ -120,6 +120,7 @@ def create_dataset_dir(
     period: int = 60,
     from_ts: str = None,
     until_ts: str = None,
+    seconds_per_time_step: int | None = None,
 ):
     return citylearn_dataset.generate_citylearn_dataset(
         name=name,
@@ -127,6 +128,7 @@ def create_dataset_dir(
         citylearn_configs=config,
         description=description,
         period=period,
+        seconds_per_time_step=seconds_per_time_step,
         from_ts=from_ts,
         until_ts=until_ts,
     )

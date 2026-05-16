@@ -4,8 +4,53 @@ from fastapi.responses import FileResponse
 
 from app.services import dataset_service
 
-def create_dataset(name: str, site_id: str, config: dict, description: str = "", period : int = 60, from_ts: str = None, until_ts: str = None):
-    return dataset_service.create_dataset(name, site_id, config, description, period, from_ts, until_ts)
+def create_dataset(
+    name: str,
+    site_id: str,
+    config: dict,
+    description: str = "",
+    period: int = 60,
+    from_ts: str = None,
+    until_ts: str = None,
+    seconds_per_time_step: int | None = None,
+):
+    return dataset_service.create_dataset(
+        name,
+        site_id,
+        config,
+        description,
+        period,
+        from_ts,
+        until_ts,
+        seconds_per_time_step,
+    )
+
+
+def create_datasets_from_mongo(
+    name_prefix: str = "auto",
+    site_ids: list[str] | None = None,
+    citylearn_configs: dict | None = None,
+    description: str = "",
+    period: int | None = None,
+    from_ts: str = None,
+    until_ts: str = None,
+    seconds_per_time_step: int | None = 15,
+    dry_run: bool = False,
+    continue_on_error: bool = True,
+):
+    return dataset_service.create_datasets_from_mongo(
+        name_prefix,
+        site_ids,
+        citylearn_configs,
+        description,
+        period,
+        from_ts,
+        until_ts,
+        seconds_per_time_step,
+        dry_run,
+        continue_on_error,
+    )
+
 
 def list_dates_available_per_collection(site_id: str):
     return dataset_service.list_dates_available_per_collection(site_id)

@@ -37,8 +37,8 @@ def shared_env(tmp_path):
 def test_dataset_service_create_calls_file_utils(monkeypatch):
     called = {}
 
-    def fake_create(name, site_id, cfg, description, period, from_ts, until_ts):
-        called["args"] = (name, site_id, cfg, description, period, from_ts, until_ts)
+    def fake_create(name, site_id, cfg, description, period, from_ts, until_ts, seconds_per_time_step=None):
+        called["args"] = (name, site_id, cfg, description, period, from_ts, until_ts, seconds_per_time_step)
         return {"warnings": ["w1"], "validation": {"static": {"ok": True}}}
 
     monkeypatch.setattr(file_utils, "create_dataset_dir", fake_create)
@@ -48,6 +48,65 @@ def test_dataset_service_create_calls_file_utils(monkeypatch):
     assert resp["warnings"] == ["w1"]
     assert resp["validation"]["static"]["ok"] is True
     assert called["args"][0] == "ds1"
+
+
+def test_dataset_service_generate_from_mongo_uses_all_site_buildings(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        file_utils,
+        "list_dataset_sites",
+        lambda: [
+            {"site_id": "living_lab", "buildings": ["R-H-01", "R-H-02"]},
+            {"site_id": "i-charging", "buildings": ["HQ"]},
+        ],
+    )
+
+    def fake_create(name, site_id, cfg, description, period, from_ts, until_ts, seconds_per_time_step=None):
+        calls.append((name, site_id, cfg, description, period, from_ts, until_ts, seconds_per_time_step))
+        return {
+            "warnings": [f"created-{site_id}"],
+            "validation": {"time_window": {"rows": 24}},
+        }
+
+    monkeypatch.setattr(file_utils, "create_dataset_dir", fake_create)
+
+    resp = dataset_service.create_datasets_from_mongo(
+        name_prefix="demo",
+        site_ids=["living_lab"],
+        citylearn_configs={"schema_overrides": {"central_agent": True}},
+        description="auto generated",
+        from_ts="2026-01-01 00:00:00",
+        until_ts="2026-01-02 00:00:00",
+    )
+
+    assert resp["created"][0]["name"] == "demo_living_lab_all_buildings"
+    assert resp["created"][0]["building_count"] == 2
+    assert resp["failed"] == []
+    assert calls[0][1] == "living_lab"
+    assert calls[0][2]["selected_buildings"] == ["R-H-01", "R-H-02"]
+    assert calls[0][2]["schema_overrides"]["central_agent"] is True
+    assert calls[0][7] == 15
+
+
+def test_dataset_service_generate_from_mongo_dry_run(monkeypatch):
+    monkeypatch.setattr(
+        file_utils,
+        "list_dataset_sites",
+        lambda: [{"site_id": "living_lab", "buildings": ["R-H-01"]}],
+    )
+    monkeypatch.setattr(
+        file_utils,
+        "create_dataset_dir",
+        lambda *args, **kwargs: pytest.fail("dry_run should not create datasets"),
+    )
+
+    resp = dataset_service.create_datasets_from_mongo(name_prefix="demo", dry_run=True)
+
+    assert resp["dry_run"] is True
+    assert resp["planned"][0]["site_id"] == "living_lab"
+    assert resp["planned"][0]["seconds_per_time_step"] == 15
+    assert resp["created"] == []
 
 
 def test_dataset_service_upload_calls_file_utils(monkeypatch):
@@ -89,6 +148,17 @@ def test_dataset_controller_passthrough(monkeypatch):
     )
     upload_resp = dataset_controller.upload_dataset(object(), "a.zip", "imported")
     assert upload_resp["name"] == "imported"
+
+
+def test_dataset_controller_generate_passthrough(monkeypatch):
+    monkeypatch.setattr(
+        dataset_service,
+        "create_datasets_from_mongo",
+        lambda *args: {"created": [{"name": "auto_living_lab_all_buildings"}]},
+    )
+
+    payload = dataset_controller.create_datasets_from_mongo("auto", ["living_lab"], {}, "", 60)
+    assert payload["created"][0]["name"] == "auto_living_lab_all_buildings"
 
 
 def test_dataset_sites_passthrough(monkeypatch):

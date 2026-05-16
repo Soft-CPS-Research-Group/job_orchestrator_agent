@@ -20,6 +20,8 @@ _SYSTEM_DATABASES = {"admin", "local", "config"}
 BUILDING_COLUMNS = [
     "month",
     "hour",
+    "minutes",
+    "seconds",
     "day_type",
     "daylight_savings_status",
     "indoor_dry_bulb_temperature",
@@ -233,7 +235,7 @@ def _safe_str(value: Any) -> str:
     return candidate
 
 
-def _parse_time_step_value(value: Any, current_ts: pd.Timestamp, period_minutes: int) -> float | None:
+def _parse_time_step_value(value: Any, current_ts: pd.Timestamp, step_seconds: int) -> float | None:
     numeric = _safe_float(value)
     if numeric is not None:
         return numeric
@@ -246,8 +248,8 @@ def _parse_time_step_value(value: Any, current_ts: pd.Timestamp, period_minutes:
             dt = _parse_timestamp(stripped)
         except Exception:
             return None
-        delta_minutes = (dt - current_ts.to_pydatetime()).total_seconds() / 60.0
-        return max(0.0, delta_minutes / float(period_minutes))
+        delta_seconds = (dt - current_ts.to_pydatetime()).total_seconds()
+        return max(0.0, delta_seconds / float(step_seconds))
 
     return None
 
@@ -370,7 +372,7 @@ def _collection_time_bounds(collection) -> tuple[datetime | None, datetime | Non
 def _resolve_time_window(
     db,
     collection_names: list[str],
-    period_minutes: int,
+    step_seconds: int,
     from_ts: str | None,
     until_ts: str | None,
 ) -> tuple[pd.Timestamp, pd.Timestamp, pd.DatetimeIndex]:
@@ -394,8 +396,8 @@ def _resolve_time_window(
     effective_start = max(requested_start, latest_start)
     effective_end = min(requested_end, earliest_end)
 
-    start_floor = pd.Timestamp(effective_start).floor(f"{period_minutes}min")
-    end_floor = pd.Timestamp(effective_end).floor(f"{period_minutes}min")
+    start_floor = pd.Timestamp(effective_start).floor(f"{step_seconds}s")
+    end_floor = pd.Timestamp(effective_end).floor(f"{step_seconds}s")
 
     if start_floor >= end_floor:
         raise HTTPException(
@@ -404,9 +406,9 @@ def _resolve_time_window(
         )
 
     target_index = pd.date_range(
-        start=start_floor + pd.Timedelta(minutes=period_minutes),
+        start=start_floor + pd.Timedelta(seconds=step_seconds),
         end=end_floor,
-        freq=f"{period_minutes}min",
+        freq=f"{step_seconds}s",
         tz="UTC",
     )
 
@@ -437,6 +439,14 @@ def _extract_pricing(payload: dict[str, Any]) -> dict[str, float | None]:
     pred_3 = _safe_float(payload.get("electricity_pricing_predicted_3"))
 
     energy_price = payload.get("energy_price")
+    if energy_price is None:
+        tariffs = payload.get("energy_tariffs")
+        if isinstance(tariffs, dict):
+            for tariff in tariffs.values():
+                if isinstance(tariff, dict) and tariff.get("energy_price") is not None:
+                    energy_price = tariff.get("energy_price")
+                    break
+
     values: list[Any] = []
 
     if isinstance(energy_price, dict):
@@ -554,7 +564,7 @@ def _extract_numeric_series_rows(flat_docs: list[dict[str, Any]]) -> pd.DataFram
     return df
 
 
-def _resample_numeric_frame(df: pd.DataFrame, target_index: pd.DatetimeIndex, period_minutes: int) -> pd.DataFrame:
+def _resample_numeric_frame(df: pd.DataFrame, target_index: pd.DatetimeIndex, step_seconds: int) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(index=target_index)
 
@@ -590,7 +600,7 @@ def _resample_numeric_frame(df: pd.DataFrame, target_index: pd.DatetimeIndex, pe
         "electricity_pricing_predicted_3": "mean",
     }
 
-    rule = f"{period_minutes}min"
+    rule = f"{step_seconds}s"
     available_agg = {k: v for k, v in agg_map.items() if k in df.columns}
     resampled = df.resample(rule, label="right", closed="right").agg(available_agg)
     return resampled.reindex(target_index)
@@ -640,6 +650,8 @@ def _build_time_columns(index: pd.DatetimeIndex) -> pd.DataFrame:
         {
             "month": lisbon.month.astype(int),
             "hour": hours,
+            "minutes": lisbon.minute.astype(int),
+            "seconds": lisbon.second.astype(int),
             "day_type": lisbon.isocalendar().day.astype(int),
             "daylight_savings_status": [int(bool(ts.dst())) for ts in lisbon.to_pydatetime()],
         },
@@ -724,6 +736,8 @@ def _base_schema_template() -> dict[str, Any]:
         "month": {"active": True, "shared_in_central_agent": True},
         "day_type": {"active": True, "shared_in_central_agent": True},
         "hour": {"active": True, "shared_in_central_agent": True},
+        "minutes": {"active": True, "shared_in_central_agent": True},
+        "seconds": {"active": True, "shared_in_central_agent": True},
         "daylight_savings_status": {"active": False, "shared_in_central_agent": True},
         "outdoor_dry_bulb_temperature": {"active": True, "shared_in_central_agent": True},
         "outdoor_dry_bulb_temperature_predicted_1": {"active": True, "shared_in_central_agent": True},
@@ -785,6 +799,7 @@ def _base_schema_template() -> dict[str, Any]:
     return {
         "random_seed": 2022,
         "root_directory": None,
+        "interface": "entity",
         "central_agent": False,
         "simulation_start_time_step": 0,
         "simulation_end_time_step": 0,
@@ -792,8 +807,16 @@ def _base_schema_template() -> dict[str, Any]:
         "rolling_episode_split": False,
         "random_episode_split": False,
         "seconds_per_time_step": 3600,
+        "ev_departure_within_tolerance": 0.05,
+        "ev_departure_service_tolerance": 0.05,
         "observations": observations,
         "actions": actions,
+        "observation_bundles": {
+            "entity_core_electrical": {"active": True},
+            "entity_community_operational": {"active": True},
+            "entity_forecasts_existing": {"active": True},
+            "entity_temporal_derived": {"active": True},
+        },
         "agent": {
             "type": "citylearn.agents.rbc.BasicElectricVehicleRBC_ReferenceController",
             "attributes": {},
@@ -845,7 +868,7 @@ def _build_charger_rows(
     building_id: str,
     charger_ids: list[str],
     resampled_sessions: pd.DataFrame,
-    period_minutes: int,
+    step_seconds: int,
     defaults: dict[str, Any],
     warnings: list[str],
 ) -> tuple[dict[str, pd.DataFrame], set[str], bool]:
@@ -901,7 +924,7 @@ def _build_charger_rows(
                         or flexibility.get("estimated_time_at_arrival")
                         or flexibility.get("arrival.time"),
                         ts,
-                        period_minutes,
+                        step_seconds,
                     ) is not None:
                         state = 2
                     else:
@@ -913,7 +936,7 @@ def _build_charger_rows(
                     or flexibility.get("estimated_time_at_departure")
                     or flexibility.get("departure.time"),
                     ts,
-                    period_minutes,
+                    step_seconds,
                 )
                 arrival_time = _parse_time_step_value(
                     session.get("electric_vehicle_estimated_arrival_time")
@@ -921,7 +944,7 @@ def _build_charger_rows(
                     or flexibility.get("estimated_time_at_arrival")
                     or flexibility.get("arrival.time"),
                     ts,
-                    period_minutes,
+                    step_seconds,
                 )
 
                 required_soc = _normalize_soc_percent(
@@ -1175,11 +1198,16 @@ def generate_citylearn_dataset(
     citylearn_configs: dict[str, Any],
     description: str = "",
     period: int = 60,
+    seconds_per_time_step: int | None = None,
     from_ts: str | None = None,
     until_ts: str | None = None,
 ) -> dict[str, Any]:
     if period < 1:
         raise HTTPException(status_code=400, detail="period must be >= 1 minute")
+
+    step_seconds = int(seconds_per_time_step) if seconds_per_time_step is not None else int(period) * 60
+    if step_seconds < 1:
+        raise HTTPException(status_code=400, detail="seconds_per_time_step must be >= 1 second")
 
     config, legacy_mode = _normalize_citylearn_configs(citylearn_configs)
     warnings: list[str] = []
@@ -1219,7 +1247,7 @@ def generate_citylearn_dataset(
     start_floor, end_floor, target_index = _resolve_time_window(
         db,
         [building_collections[bid] for bid in selected_buildings],
-        period,
+        step_seconds,
         from_ts,
         until_ts,
     )
@@ -1246,7 +1274,7 @@ def generate_citylearn_dataset(
             db[reference_collection_name].find(
                 {
                     "timestamp": {
-                        "$gte": (start_floor - pd.Timedelta(minutes=period)).to_pydatetime(),
+                        "$gte": (start_floor - pd.Timedelta(seconds=step_seconds)).to_pydatetime(),
                         "$lte": end_floor.to_pydatetime(),
                     }
                 }
@@ -1258,7 +1286,7 @@ def generate_citylearn_dataset(
 
         reference_flat_docs = [_flatten_document(doc) for doc in reference_docs]
         reference_df = _extract_numeric_series_rows(reference_flat_docs)
-        reference_resampled = _resample_numeric_frame(reference_df, target_index, period)
+        reference_resampled = _resample_numeric_frame(reference_df, target_index, step_seconds)
 
         pricing_frame = _fill_series_with_defaults(
             _fill_predicted_from_base(
@@ -1325,7 +1353,7 @@ def generate_citylearn_dataset(
                 db[collection_name].find(
                     {
                         "timestamp": {
-                            "$gte": (start_floor - pd.Timedelta(minutes=period)).to_pydatetime(),
+                            "$gte": (start_floor - pd.Timedelta(seconds=step_seconds)).to_pydatetime(),
                             "$lte": end_floor.to_pydatetime(),
                         }
                     }
@@ -1340,7 +1368,7 @@ def generate_citylearn_dataset(
 
             flat_docs = [_flatten_document(doc) for doc in docs]
             numeric_df = _extract_numeric_series_rows(flat_docs)
-            numeric_resampled = _resample_numeric_frame(numeric_df, target_index, period)
+            numeric_resampled = _resample_numeric_frame(numeric_df, target_index, step_seconds)
 
             building_numeric = _fill_series_with_defaults(
                 numeric_resampled[[col for col in BUILDING_COLUMNS if col in numeric_resampled.columns]]
@@ -1405,7 +1433,7 @@ def generate_citylearn_dataset(
                     session_df.dropna(subset=["timestamp"]) \
                     .sort_values("timestamp") \
                     .set_index("timestamp") \
-                    .resample(f"{period}min", label="right", closed="right") \
+                    .resample(f"{step_seconds}s", label="right", closed="right") \
                     .last() \
                     .reindex(target_index)
                 )
@@ -1426,7 +1454,7 @@ def generate_citylearn_dataset(
                 building_id,
                 charger_ids,
                 session_df,
-                period,
+                step_seconds,
                 defaults,
                 warnings,
             )
@@ -1497,7 +1525,7 @@ def generate_citylearn_dataset(
 
         base_schema = _base_schema_template()
         base_schema["description"] = description or ""
-        base_schema["seconds_per_time_step"] = int(period) * 60
+        base_schema["seconds_per_time_step"] = step_seconds
         base_schema["simulation_start_time_step"] = 0
         base_schema["simulation_end_time_step"] = expected_length - 1
         base_schema["buildings"] = buildings_schema
@@ -1571,6 +1599,7 @@ def generate_citylearn_dataset(
                 "from_ts": target_index[0].isoformat(),
                 "until_ts": target_index[-1].isoformat(),
                 "rows": expected_length,
+                "seconds_per_time_step": step_seconds,
             },
         }
 
