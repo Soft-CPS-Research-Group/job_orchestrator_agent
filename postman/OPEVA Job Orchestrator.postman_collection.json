@@ -1,0 +1,566 @@
+{
+  "info": {
+    "name": "OPEVA Job Orchestrator",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+    "description": "Job orchestration endpoints migrated from opeva_backend_api_training. Default base URL is http://localhost:8011."
+  },
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/health"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Experiment Configs",
+      "item": [
+        {
+          "name": "Create Experiment Config",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"file_name\": \"{{config_file}}\",\n  \"yaml_content\": \"metadata:\\n  experiment_name: postman_orchestrator\\n  run_name: smoke\\nsimulator:\\n  dataset_name: demo_dataset\\n  dataset_path: /data/datasets/demo_dataset/schema.json\\n\"\n}"
+            },
+            "url": "{{baseUrl}}/experiment-config/create"
+          },
+          "response": []
+        },
+        {
+          "name": "List Experiment Configs",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/experiment-configs"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Experiment Config",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/experiment-config/{{config_file}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Update Experiment Config",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"yaml_content\": \"metadata:\\n  experiment_name: postman_orchestrator\\n  run_name: updated\\nsimulator:\\n  dataset_name: demo_dataset\\n  dataset_path: /data/datasets/demo_dataset/schema.json\\n\"\n}"
+            },
+            "url": "{{baseUrl}}/experiment-config/{{config_file}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Experiment Config",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/experiment-config/{{config_file}}"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Datasets",
+      "item": [
+        {
+          "name": "Create Dataset",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"{{dataset_name}}\",\n  \"site_id\": \"{{site_id}}\",\n  \"citylearn_configs\": {},\n  \"description\": \"dataset generated from Postman\",\n  \"period\": 60,\n  \"from_ts\": \"2025-05-27 00:00:00\",\n  \"until_ts\": \"2025-05-27 18:00:00\"\n}"
+            },
+            "url": "{{baseUrl}}/dataset"
+          },
+          "response": []
+        },
+        {
+          "name": "List Datasets",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/datasets"
+          },
+          "response": []
+        },
+        {
+          "name": "List Dates Available",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/dataset/dates-available/{{site_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Upload Dataset (ZIP)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "name",
+                  "value": "{{dataset_name}}",
+                  "type": "text"
+                },
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": "/tmp/sample-dataset.zip"
+                }
+              ]
+            },
+            "url": "{{baseUrl}}/dataset/upload"
+          },
+          "response": []
+        },
+        {
+          "name": "Download Dataset",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{baseUrl}}/dataset/download/{{dataset_name}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Dataset",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": "{{baseUrl}}/dataset/{{dataset_name}}"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Jobs",
+      "item": [
+        {
+          "name": "Run Simulation - Inline Config",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"config\": {\n    \"metadata\": {\n      \"experiment_name\": \"postman_orchestrator\",\n      \"run_name\": \"inline\"\n    },\n    \"simulator\": {\n      \"dataset_name\": \"demo_dataset\",\n      \"dataset_path\": \"/data/datasets/demo_dataset/schema.json\"\n    }\n  },\n  \"save_as\": \"postman_inline.yaml\",\n  \"target_host\": \"{{worker_id}}\",\n  \"image_tag\": \"latest\",\n  \"submitted_by\": \"postman\"\n}"
+            },
+            "url": "{{baseUrl}}/run-simulation"
+          },
+          "response": []
+        },
+        {
+          "name": "Run Simulation - Config Path",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"config_path\": \"configs/{{config_file}}\",\n  \"target_host\": \"{{worker_id}}\",\n  \"image_tag\": \"latest\",\n  \"submitted_by\": \"postman\"\n}"
+            },
+            "url": "{{baseUrl}}/run-simulation"
+          },
+          "response": []
+        },
+        {
+          "name": "List Jobs",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/jobs"
+          },
+          "response": []
+        },
+        {
+          "name": "List Queue",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/queue"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Status",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/status/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Result",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/result/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Progress",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/progress/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Logs",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/logs/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Logs Chunk",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/logs-chunk/{{job_id}}?tail_lines=200&max_bytes=262144"
+          },
+          "response": []
+        },
+        {
+          "name": "Get File Logs",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/file-logs/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Job Info",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/job-info/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Get Job Resolved Config",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/job-resolved-config/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "List Hosts",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/hosts"
+          },
+          "response": []
+        },
+        {
+          "name": "List Job Image Versions",
+          "request": {
+            "method": "GET",
+            "url": "{{baseUrl}}/job-images/versions?repository=calof/opeva_simulator&limit=50"
+          },
+          "response": []
+        },
+        {
+          "name": "Stop Job",
+          "request": {
+            "method": "POST",
+            "url": "{{baseUrl}}/stop/{{job_id}}"
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Job",
+          "request": {
+            "method": "DELETE",
+            "url": "{{baseUrl}}/job/{{job_id}}"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Simulation Data",
+      "item": [
+        {
+          "name": "Simulation Data Index",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"job_id\": \"{{job_id}}\",\n  \"session\": \"latest\"\n}"
+            },
+            "url": "{{baseUrl}}/simulation-data/index"
+          },
+          "response": []
+        },
+        {
+          "name": "Simulation Data File",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"job_id\": \"{{job_id}}\",\n  \"session\": \"latest\",\n  \"relative_path\": \"community.csv\"\n}"
+            },
+            "url": "{{baseUrl}}/simulation-data/file"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Agent",
+      "item": [
+        {
+          "name": "Heartbeat",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"worker_id\": \"{{worker_id}}\",\n  \"info\": {\n    \"executor\": \"docker\",\n    \"worker_version\": \"{{worker_version}}\",\n    \"active_job_id\": \"{{job_id}}\"\n  }\n}"
+            },
+            "url": "{{baseUrl}}/api/agent/heartbeat"
+          },
+          "response": []
+        },
+        {
+          "name": "Next Job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"worker_id\": \"{{worker_id}}\"\n}"
+            },
+            "url": "{{baseUrl}}/api/agent/next-job"
+          },
+          "response": []
+        },
+        {
+          "name": "Job Status Update",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"job_id\": \"{{job_id}}\",\n  \"status\": \"running\",\n  \"worker_id\": \"{{worker_id}}\",\n  \"worker_version\": \"{{worker_version}}\",\n  \"container_id\": \"postman-container\",\n  \"container_name\": \"postman-container\"\n}"
+            },
+            "url": "{{baseUrl}}/api/agent/job-status"
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Ops",
+      "item": [
+        {
+          "name": "Requeue Job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"force\": false,\n  \"preferred_host\": null,\n  \"require_host\": null\n}"
+            },
+            "url": "{{baseUrl}}/ops/jobs/{{job_id}}/requeue"
+          },
+          "response": []
+        },
+        {
+          "name": "Stop Job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"ops_manual_stop\"\n}"
+            },
+            "url": "{{baseUrl}}/ops/jobs/{{job_id}}/stop"
+          },
+          "response": []
+        },
+        {
+          "name": "Fail Job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"ops_failed\",\n  \"force\": false\n}"
+            },
+            "url": "{{baseUrl}}/ops/jobs/{{job_id}}/fail"
+          },
+          "response": []
+        },
+        {
+          "name": "Cancel Job",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"ops_canceled\",\n  \"force\": false\n}"
+            },
+            "url": "{{baseUrl}}/ops/jobs/{{job_id}}/cancel"
+          },
+          "response": []
+        },
+        {
+          "name": "Cleanup Queue",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"force\": true\n}"
+            },
+            "url": "{{baseUrl}}/ops/queue/cleanup"
+          },
+          "response": []
+        },
+        {
+          "name": "Cleanup Jobs Registry",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"keep\": [\n    \"{{job_id}}\"\n  ]\n}"
+            },
+            "url": "{{baseUrl}}/ops/jobs/cleanup"
+          },
+          "response": []
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8011"
+    },
+    {
+      "key": "job_id",
+      "value": "REPLACE_WITH_JOB_ID"
+    },
+    {
+      "key": "worker_id",
+      "value": "server"
+    },
+    {
+      "key": "worker_version",
+      "value": "0.4.1"
+    },
+    {
+      "key": "config_file",
+      "value": "postman_test.yaml"
+    },
+    {
+      "key": "dataset_name",
+      "value": "postman_dataset"
+    },
+    {
+      "key": "site_id",
+      "value": "living_lab"
+    }
+  ]
+}

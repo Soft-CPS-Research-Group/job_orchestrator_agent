@@ -1,0 +1,5 @@
+{
+  "status": "completed",
+  "summary": "Sample result output",
+  "metrics": {"accuracy": 0.95}
+}
