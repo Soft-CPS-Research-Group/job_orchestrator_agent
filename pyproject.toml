@@ -15,6 +15,7 @@ dependencies = [
     "pymongo",
     "numpy>=1.26,<3",
     "pandas>=2.2,<3",
+    "pyarrow>=18,<23",
     "python-multipart",
     "uvicorn",
 ]

@@ -25,7 +25,7 @@ def test_list_datasets_returns_description(dataset_env):
 
     dir_path = os.path.join(datasets_dir, "dir_ds")
     os.makedirs(dir_path)
-    with open(os.path.join(dir_path, "a.txt"), "w") as f:
+    with open(os.path.join(dir_path, "a.parquet"), "w") as f:
         f.write("hi")
 
     file_path = os.path.join(datasets_dir, "file_ds.csv")
@@ -38,6 +38,43 @@ def test_list_datasets_returns_description(dataset_env):
     assert "file_ds.csv" in names
     dir_meta = next(d for d in datasets if d["name"] == "dir_ds")
     assert "description" in dir_meta
+    assert dir_meta["format"] == "parquet"
+    assert dir_meta["type"] == "parquet"
+    assert dir_meta["formats"] == ["parquet"]
+    assert dir_meta["format_counts"] == {"parquet": 1}
+    file_meta = next(d for d in datasets if d["name"] == "file_ds.csv")
+    assert file_meta["format"] == "csv"
+
+
+def test_list_datasets_uses_majority_file_format(dataset_env):
+    file_utils, settings = dataset_env
+    datasets_dir = settings.DATASETS_DIR
+    dataset_dir = Path(datasets_dir) / "majority_ds"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "schema.json").write_text("{}", encoding="utf-8")
+    (dataset_dir / "a.csv").write_text("a\n1\n", encoding="utf-8")
+    (dataset_dir / "b.parquet").write_text("not-real-parquet", encoding="utf-8")
+    (dataset_dir / "c.parquet").write_text("not-real-parquet", encoding="utf-8")
+
+    dataset = next(item for item in file_utils.list_available_datasets() if item["name"] == "majority_ds")
+
+    assert dataset["format"] == "parquet"
+    assert dataset["formats"] == ["csv", "parquet"]
+    assert dataset["format_counts"] == {"csv": 1, "parquet": 2}
+
+
+def test_list_datasets_marks_tied_formats_as_mixed(dataset_env):
+    file_utils, settings = dataset_env
+    dataset_dir = Path(settings.DATASETS_DIR) / "mixed_ds"
+    dataset_dir.mkdir(parents=True)
+    (dataset_dir / "schema.json").write_text("{}", encoding="utf-8")
+    (dataset_dir / "a.csv").write_text("a\n1\n", encoding="utf-8")
+    (dataset_dir / "b.parquet").write_text("not-real-parquet", encoding="utf-8")
+
+    dataset = next(item for item in file_utils.list_available_datasets() if item["name"] == "mixed_ds")
+
+    assert dataset["format"] == "mixed"
+    assert dataset["formats"] == ["csv", "parquet"]
 
 def test_delete_dataset_by_name(dataset_env):
     file_utils, settings = dataset_env
@@ -82,6 +119,8 @@ def test_upload_dataset_archive_extracts_zip(dataset_env):
 
     result = file_utils.upload_dataset_archive(payload, "site.zip", "uploaded_ds")
     assert result["name"] == "uploaded_ds"
+    assert result["format"] == "csv"
+    assert result["format_counts"] == {"csv": 1}
     extracted_file = Path(settings.DATASETS_DIR) / "uploaded_ds" / "input.csv"
     assert extracted_file.exists()
     metadata = json.loads((Path(settings.DATASETS_DIR) / "uploaded_ds" / "upload_metadata.json").read_text())

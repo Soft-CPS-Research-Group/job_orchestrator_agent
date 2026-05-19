@@ -11,6 +11,13 @@ import yaml
 from app.config import settings
 from app.utils import citylearn_dataset, mongo_utils
 
+DATASET_FORMAT_SUFFIXES = {
+    ".csv": "csv",
+    ".parquet": "parquet",
+    ".pq": "parquet",
+    ".parq": "parquet",
+}
+
 
 def _safe_config_filename(file_name: str) -> str:
     normalized = os.path.normpath(file_name).strip().lstrip("/\\")
@@ -180,6 +187,39 @@ def _get_path_size(path: str) -> int:
     return total
 
 
+def _dataset_file_format(path: str) -> str | None:
+    return DATASET_FORMAT_SUFFIXES.get(os.path.splitext(path)[1].lower())
+
+
+def dataset_format_metadata(path: str) -> dict:
+    counts: dict[str, int] = {}
+
+    if os.path.isfile(path):
+        file_format = _dataset_file_format(path)
+        if file_format:
+            counts[file_format] = 1
+    else:
+        for dirpath, _, filenames in os.walk(path):
+            for file_name in filenames:
+                file_format = _dataset_file_format(os.path.join(dirpath, file_name))
+                if file_format:
+                    counts[file_format] = counts.get(file_format, 0) + 1
+
+    if not counts:
+        dataset_format = "unknown"
+    else:
+        max_count = max(counts.values())
+        winners = sorted(format_name for format_name, count in counts.items() if count == max_count)
+        dataset_format = winners[0] if len(winners) == 1 else "mixed"
+
+    return {
+        "format": dataset_format,
+        "type": dataset_format,
+        "formats": sorted(counts),
+        "format_counts": counts,
+    }
+
+
 def list_available_datasets():
     datasets = []
     if not os.path.exists(settings.DATASETS_DIR):
@@ -200,7 +240,13 @@ def list_available_datasets():
         except Exception:
             description = ""
 
-        datasets.append({"name": name, "description": description})
+        datasets.append(
+            {
+                "name": name,
+                "description": description,
+                **dataset_format_metadata(path),
+            }
+        )
     return datasets
 
 
@@ -278,6 +324,7 @@ def upload_dataset_archive(file_obj, source_filename: str, dataset_name: str | N
             "name": safe_name,
             "path": target_path,
             "size_bytes": _get_path_size(target_path),
+            **dataset_format_metadata(target_path),
         }
     except Exception:
         if os.path.exists(target_path):

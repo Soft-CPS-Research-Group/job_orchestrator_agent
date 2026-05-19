@@ -1069,11 +1069,17 @@ def _build_static_validation(
         if not os.path.isfile(path):
             errors.append(f"Referenced file '{filename}' does not exist in dataset directory.")
 
-    def _check_csv(path: str, expected_columns: list[str], label: str, expect_length: int = expected_length):
+    def _read_timeseries_file(path: str):
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix in {".parquet", ".pq", ".parq"}:
+            return pd.read_parquet(path)
+        return pd.read_csv(path)
+
+    def _check_timeseries_file(path: str, expected_columns: list[str], label: str, expect_length: int = expected_length):
         if not os.path.isfile(path):
             return
         try:
-            frame = pd.read_csv(path)
+            frame = _read_timeseries_file(path)
         except Exception as exc:
             errors.append(f"Failed to read {label} '{os.path.basename(path)}': {exc}")
             return
@@ -1092,7 +1098,7 @@ def _build_static_validation(
     for building in buildings.values():
         energy_file = building.get("energy_simulation")
         if isinstance(energy_file, str):
-            _check_csv(os.path.join(dataset_dir, energy_file), BUILDING_COLUMNS, "energy_simulation")
+            _check_timeseries_file(os.path.join(dataset_dir, energy_file), BUILDING_COLUMNS, "energy_simulation")
 
     shared_files = {
         "pricing": (schema.get("buildings", {}), "pricing", PRICING_COLUMNS),
@@ -1106,14 +1112,14 @@ def _build_static_validation(
             filename = building.get(field)
             if isinstance(filename, str) and filename not in seen:
                 seen.add(filename)
-                _check_csv(os.path.join(dataset_dir, filename), columns, field)
+                _check_timeseries_file(os.path.join(dataset_dir, filename), columns, field)
 
     for building in buildings.values():
         chargers = building.get("chargers") if isinstance(building.get("chargers"), dict) else {}
         for charger in chargers.values():
             filename = charger.get("charger_simulation") if isinstance(charger, dict) else None
             if isinstance(filename, str):
-                _check_csv(
+                _check_timeseries_file(
                     os.path.join(dataset_dir, filename),
                     CHARGER_COLUMNS,
                     "charger_simulation",
@@ -1123,7 +1129,7 @@ def _build_static_validation(
         for wm in washing.values():
             filename = wm.get("washing_machine_energy_simulation") if isinstance(wm, dict) else None
             if isinstance(filename, str):
-                _check_csv(
+                _check_timeseries_file(
                     os.path.join(dataset_dir, filename),
                     WASHING_MACHINE_COLUMNS,
                     "washing_machine_simulation",

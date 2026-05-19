@@ -46,10 +46,16 @@ def create_dataset(
         until_ts,
         seconds_per_time_step,
     )
+    format_metadata = (
+        file_utils.dataset_format_metadata(payload["path"])
+        if payload.get("path")
+        else {"format": "unknown", "type": "unknown", "formats": [], "format_counts": {}}
+    )
     return {
         "message": "Dataset created",
         "name": name,
         "description": description,
+        **format_metadata,
         "warnings": payload.get("warnings", []),
         "validation": payload.get("validation", {}),
     }
@@ -198,4 +204,8 @@ def upload_dataset_archive(file_obj, source_filename: str, dataset_name: str | N
         "message": "Dataset uploaded",
         "name": payload["name"],
         "size_bytes": payload["size_bytes"],
+        "format": payload.get("format", "unknown"),
+        "type": payload.get("type", "unknown"),
+        "formats": payload.get("formats", []),
+        "format_counts": payload.get("format_counts", {}),
     }
