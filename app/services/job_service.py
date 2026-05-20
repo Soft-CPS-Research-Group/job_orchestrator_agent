@@ -13,6 +13,7 @@ from urllib import error as urllib_error
 
 from app.config import settings
 from app.models.job import JobLaunchRequest
+from app.services import email_notification_service
 from app.utils import job_utils, file_utils
 from app.status import JobStatus, can_transition
 
@@ -374,6 +375,26 @@ def _compute_job_durations(meta: dict, now_ts: float | None = None) -> dict:
         "total_duration_seconds": total_duration_seconds,
     }
 
+
+def _status_notification_meta(job_id: str, status: str) -> dict[str, Any]:
+    meta = dict(jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {})
+    status_payload = _read_status_payload(job_id) or {}
+    meta.update(status_payload)
+    meta["job_id"] = job_id
+    meta["status"] = status
+    meta.update(_compute_job_durations(meta))
+    return meta
+
+
+def _notify_status_change(job_id: str, previous_status: str | None, status: str) -> None:
+    email_notification_service.notify_job_status_change(
+        job_id=job_id,
+        previous_status=previous_status,
+        status=status,
+        job=_status_notification_meta(job_id, status),
+    )
+
+
 def _write_status(job_id: str, status: str, extra: dict | None = None):
     """Persist status to disk and update the in-memory jobs cache."""
     prev = _read_status_file(job_id)
@@ -404,10 +425,12 @@ def _write_status(job_id: str, status: str, extra: dict | None = None):
             status_ts=status_ts,
         )
         job_utils.save_job(job_id, jobs[job_id])
+    _notify_status_change(job_id, prev, status)
 
 
 def _force_status(job_id: str, status: str, extra: dict | None = None) -> None:
     """Write status without enforcing state transitions (ops override)."""
+    prev = _read_status_file(job_id)
     status_ts = time.time()
     extra_payload = dict(extra or {})
     extra_payload.setdefault("status_updated_at", status_ts)
@@ -426,6 +449,7 @@ def _force_status(job_id: str, status: str, extra: dict | None = None) -> None:
         )
         job_utils.save_job(job_id, meta)
         jobs[job_id] = meta
+    _notify_status_change(job_id, prev, status)
 
 # ---------- API: launch ----------
 def _as_positive_int(value: Any) -> int | None:
@@ -1285,7 +1309,7 @@ async def launch_simulation(request: JobLaunchRequest):
     experiment_name, run_name = _resolve_experiment_identity(runtime_config)
     requested_job_name = (request.job_name or "").strip()
     job_name = requested_job_name or f"{experiment_name}-{run_name}"
-    submitted_by = (request.submitted_by or "").strip() or None
+    submitted_by = email_notification_service.normalize_submitted_by((request.submitted_by or "").strip() or None)
     image_tag = _normalize_image_tag(request.image_tag)
     job_image = _resolve_job_image_from_tag(image_tag)
     deucalion_options = _normalize_deucalion_options(

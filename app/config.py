@@ -62,6 +62,37 @@ class Settings(BaseSettings):
     MLFLOW_TRACKING_URI: str | None = None
     DEUCALION_MLFLOW_TRACKING_URI: str = "file:/data/mlflow/mlruns"
     MLFLOW_UI_BASE_URL: str | None = None
+    UI_BASE_URL: str | None = "http://193.136.62.78:3000"
+    UI_LINK_NETWORK_NOTICE: str | None = "Este link so abre se estiveres ligado a VPN/rede ISEP."
+
+    JOB_EMAIL_NOTIFICATIONS_ENABLED: bool = False
+    JOB_EMAIL_RABBITMQ_HOST: str = "smtp-service"
+    JOB_EMAIL_RABBITMQ_PORT: int = 8016
+    JOB_EMAIL_RABBITMQ_QUEUE: str = "email_requests"
+    JOB_EMAIL_RABBITMQ_USERNAME: str | None = None
+    JOB_EMAIL_RABBITMQ_PASSWORD: str | None = None
+    JOB_EMAIL_RABBITMQ_VHOST: str = "/"
+    JOB_EMAIL_RABBITMQ_SOCKET_TIMEOUT_SECONDS: float = 2.0
+    JOB_EMAIL_REPLY_TO: str | None = None
+    JOB_EMAIL_NOTIFY_STATUSES: list[str] = [
+        "queued",
+        "dispatched",
+        "running",
+        "stop_requested",
+        "finished",
+        "failed",
+        "stopped",
+        "canceled",
+    ]
+    JOB_EMAIL_SUBMITTER_EMAILS: dict[str, str] = {
+        "tiago": "calof@isep.ipp.pt",
+        "tiago fonseca": "calof@isep.ipp.pt",
+        "calof": "calof@isep.ipp.pt",
+        "codex": "calof@isep.ipp.pt",
+    }
+    JOB_EMAIL_SUBMITTER_NAMES: dict[str, str] = {
+        "codex": "Tiago Fonseca",
+    }
 
     MONGO_USER: str = "runtimeUI"
     MONGO_PASSWORD: str = "runtimeUIDB"
@@ -136,6 +167,52 @@ class Settings(BaseSettings):
     @classmethod
     def _parse_cors_origins(cls, value: Any) -> list[str]:
         return _parse_cors_allowed_origins(value)
+
+    @field_validator("JOB_EMAIL_NOTIFY_STATUSES", mode="before")
+    @classmethod
+    def _parse_notify_statuses(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith("["):
+                try:
+                    decoded = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(decoded, list):
+                        return [str(item).strip() for item in decoded if str(item).strip()]
+            return [item.strip() for item in raw.split(",") if item.strip()]
+        return value
+
+    @field_validator("JOB_EMAIL_SUBMITTER_EMAILS", "JOB_EMAIL_SUBMITTER_NAMES", mode="before")
+    @classmethod
+    def _parse_email_mapping(cls, value: Any) -> dict[str, str]:
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return {}
+            if raw.startswith("{"):
+                try:
+                    decoded = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(decoded, dict):
+                        return {str(key).strip(): str(item).strip() for key, item in decoded.items() if str(key).strip()}
+
+            parsed: dict[str, str] = {}
+            for entry in raw.split(","):
+                if "=" not in entry:
+                    continue
+                key, item = entry.split("=", 1)
+                key = key.strip()
+                item = item.strip()
+                if key and item:
+                    parsed[key] = item
+            return parsed
+        return value
 
     def mongo_uri(self, db_name: str) -> str:
         return (

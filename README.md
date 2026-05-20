@@ -96,6 +96,15 @@ Common environment variables:
 | `MLFLOW_TRACKING_URI` | unset | Tracking URI injected into non-Deucalion jobs. |
 | `DEUCALION_MLFLOW_TRACKING_URI` | `file:/data/mlflow/mlruns` | Tracking URI injected into Deucalion jobs. |
 | `MLFLOW_UI_BASE_URL` | unset | Base URL used to build MLflow links in job info. |
+| `UI_BASE_URL` | `http://193.136.62.78:3000` | Public frontend base URL used in job notification emails. Leave unset to omit the UI link. |
+| `UI_LINK_NETWORK_NOTICE` | VPN/ISEP notice | Notice shown next to UI links in job notification emails. |
+| `JOB_EMAIL_NOTIFICATIONS_ENABLED` | `false` | Enables RabbitMQ job status emails. |
+| `JOB_EMAIL_RABBITMQ_HOST` | `smtp-service` | RabbitMQ host for email requests. |
+| `JOB_EMAIL_RABBITMQ_PORT` | `8016` | RabbitMQ port for email requests. |
+| `JOB_EMAIL_RABBITMQ_QUEUE` | `email_requests` | Queue receiving email request JSON messages. |
+| `JOB_EMAIL_NOTIFY_STATUSES` | `queued,dispatched,running,stop_requested,finished,failed,stopped,canceled` | Job statuses that trigger emails. |
+| `JOB_EMAIL_SUBMITTER_EMAILS` | Tiago/Codex to `calof@isep.ipp.pt` | Submitter-to-recipient map. Accepts JSON or `name=email,name2=email2`. |
+| `JOB_EMAIL_SUBMITTER_NAMES` | `codex=Tiago Fonseca` | Submitter display-name aliases used in job metadata and emails. |
 | `MONGO_*` | existing OPEVA defaults | Mongo connection used by dataset generation. |
 
 ## Development
