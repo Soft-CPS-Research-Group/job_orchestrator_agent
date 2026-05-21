@@ -1148,6 +1148,47 @@ def test_mark_stale_deucalion_dispatched_pending_is_preserved(monkeypatch):
     assert track[job_id]["status"] == JobStatus.DISPATCHED.value
 
 
+def test_mark_stale_deucalion_running_is_preserved_when_heartbeat_reports_active(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+
+    job_id = "job-deucalion-running"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "deucalion",
+        "preferred_host": "deucalion",
+        "require_host": True,
+        "status": JobStatus.RUNNING.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    stale_ts = time.time() - 10
+    (job_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "status": JobStatus.RUNNING.value,
+                "status_updated_at": stale_ts,
+            }
+        )
+    )
+    job_service.host_heartbeats["deucalion"] = {
+        "last_seen": time.time(),
+        "info": {
+            "active_job_ids": [job_id],
+            "active_jobs": [{"job_id": job_id, "slurm_state": "RUNNING"}],
+        },
+    }
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.RUNNING.value
+    track = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
+    assert track[job_id]["status"] == JobStatus.RUNNING.value
+
+
 def test_ops_requeue_dispatched():
     settings.AVAILABLE_HOSTS = ["worker-a"]
     job_id = "job-ops-requeue"

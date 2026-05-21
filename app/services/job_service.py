@@ -876,7 +876,7 @@ def _status_stale_ttl(meta: dict, status: str) -> int:
     return ttl
 
 
-def _should_preserve_deucalion_dispatched(job_id: str, meta: dict, now_ts: float) -> bool:
+def _should_preserve_deucalion_active_status(job_id: str, meta: dict, now_ts: float) -> bool:
     host = str(meta.get("target_host") or meta.get("preferred_host") or "")
     if host != "deucalion":
         return False
@@ -885,10 +885,6 @@ def _should_preserve_deucalion_dispatched(job_id: str, meta: dict, now_ts: float
     details = payload.get("details")
     if not isinstance(details, dict):
         details = {}
-
-    slurm_state = details.get("slurm_state")
-    if not isinstance(slurm_state, str) or slurm_state.strip().upper() not in DEUCALION_SLURM_ACTIVE_STATES:
-        return False
 
     hb = host_heartbeats.get("deucalion")
     if not hb:
@@ -901,7 +897,13 @@ def _should_preserve_deucalion_dispatched(job_id: str, meta: dict, now_ts: float
         return False
 
     info = hb.get("info")
+    heartbeat_slurm_state = None
     if isinstance(info, dict):
+        active_jobs = _normalize_active_jobs_payload(info.get("active_jobs"))
+        for row in active_jobs:
+            if row.get("job_id") == job_id:
+                heartbeat_slurm_state = row.get("slurm_state")
+                break
         active_job_ids = info.get("active_job_ids")
         if isinstance(active_job_ids, list):
             normalized_ids = {str(item) for item in active_job_ids if isinstance(item, str)}
@@ -911,6 +913,10 @@ def _should_preserve_deucalion_dispatched(job_id: str, meta: dict, now_ts: float
             active_job_id = info.get("active_job_id")
             if active_job_id and active_job_id != job_id:
                 return False
+
+    slurm_state = details.get("slurm_state") or heartbeat_slurm_state
+    if not isinstance(slurm_state, str) or slurm_state.strip().upper() not in DEUCALION_SLURM_ACTIVE_STATES:
+        return False
 
     return True
 
@@ -1209,9 +1215,10 @@ def _mark_stale_jobs():
         status_ttl = _status_stale_ttl(meta, status)
         last_update = _status_last_update(job_id)
         if last_update and (now - last_update) > status_ttl:
-            if status == JobStatus.DISPATCHED.value and _should_preserve_deucalion_dispatched(job_id, meta, now):
+            if _should_preserve_deucalion_active_status(job_id, meta, now):
                 _LOGGER.info(
-                    "Keeping dispatched Deucalion job %s while Slurm state is active",
+                    "Keeping %s Deucalion job %s while heartbeat/Slurm state is active",
+                    status,
                     job_id,
                 )
             else:
