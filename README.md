@@ -98,7 +98,7 @@ Common environment variables:
 | `MLFLOW_UI_BASE_URL` | unset | Base URL used to build MLflow links in job info. |
 | `UI_BASE_URL` | `http://193.136.62.78:3000` | Public frontend base URL used in job notification emails. Leave unset to omit the UI link. |
 | `UI_LINK_NETWORK_NOTICE` | VPN/ISEP notice | Notice shown next to UI links in job notification emails. |
-| `JOB_EMAIL_NOTIFICATIONS_ENABLED` | `false` | Enables RabbitMQ job status emails. |
+| `JOB_EMAIL_NOTIFICATIONS_ENABLED` | `true` | Enables RabbitMQ job status emails. |
 | `JOB_EMAIL_RABBITMQ_HOST` | `smtp-service` | RabbitMQ host for email requests. |
 | `JOB_EMAIL_RABBITMQ_PORT` | `8016` | RabbitMQ port for email requests. |
 | `JOB_EMAIL_RABBITMQ_QUEUE` | `email_requests` | Queue receiving email request JSON messages. |

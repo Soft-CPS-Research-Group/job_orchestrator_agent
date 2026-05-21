@@ -1,6 +1,7 @@
 import html
 import json
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -10,6 +11,7 @@ from app.config import settings
 
 
 _LOGGER = logging.getLogger(__name__)
+_EMAIL_ADDRESS_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 _STATUS_LABELS = {
     "queued": "queued",
@@ -44,6 +46,13 @@ def _normalized_mapping(mapping: dict[str, str] | None) -> dict[str, str]:
     return {_mapping_key(key): str(value).strip() for key, value in mapping.items() if _mapping_key(key) and str(value).strip()}
 
 
+def _email_recipient(value: Any) -> str | None:
+    text = str(value or "").strip()
+    if _EMAIL_ADDRESS_RE.fullmatch(text):
+        return text
+    return None
+
+
 def normalize_submitted_by(submitted_by: str | None) -> str | None:
     """Normalize service submitters to a human-facing name shown in the UI."""
     text = str(submitted_by or "").strip()
@@ -53,10 +62,20 @@ def normalize_submitted_by(submitted_by: str | None) -> str | None:
 
 
 def _recipient_for_submitter(submitted_by: str | None) -> str | None:
-    text = normalize_submitted_by(submitted_by)
-    if not text:
+    raw_text = str(submitted_by or "").strip()
+    normalized_text = normalize_submitted_by(raw_text)
+    if not normalized_text:
         return None
-    return _normalized_mapping(settings.JOB_EMAIL_SUBMITTER_EMAILS).get(_mapping_key(text))
+    mapping = _normalized_mapping(settings.JOB_EMAIL_SUBMITTER_EMAILS)
+    for candidate in (raw_text, normalized_text):
+        recipient = mapping.get(_mapping_key(candidate))
+        if recipient:
+            return recipient
+    for candidate in (raw_text, normalized_text):
+        recipient = _email_recipient(candidate)
+        if recipient:
+            return recipient
+    return None
 
 
 def _status_is_notifiable(status: str) -> bool:
@@ -264,12 +283,17 @@ def _publish_email_request(message: dict[str, Any]) -> None:
     )
     try:
         channel = connection.channel()
+        channel.queue_declare(queue=settings.JOB_EMAIL_RABBITMQ_QUEUE, durable=True)
+        channel.confirm_delivery()
         channel.basic_publish(
             exchange="",
             routing_key=settings.JOB_EMAIL_RABBITMQ_QUEUE,
             body=json.dumps(message, ensure_ascii=False).encode("utf-8"),
+            mandatory=True,
             properties=pika.BasicProperties(content_type="application/json", delivery_mode=2),
         )
+    except pika.exceptions.UnroutableError as exc:
+        raise RuntimeError(f"RabbitMQ could not route message to queue {settings.JOB_EMAIL_RABBITMQ_QUEUE!r}") from exc
     finally:
         try:
             connection.close()
@@ -298,7 +322,7 @@ def notify_job_status_change(
         job=job,
     )
     if not message:
-        _LOGGER.debug("Skipping job status email for %s: no recipient for submitter %r", job_id, job.get("submitted_by"))
+        _LOGGER.warning("Skipping job status email for %s: no recipient for submitter %r", job_id, job.get("submitted_by"))
         return
 
     try:

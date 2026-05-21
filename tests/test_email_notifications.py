@@ -1,4 +1,6 @@
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,6 +67,21 @@ def test_codex_submitter_builds_tiago_email_with_ui_link(monkeypatch):
     assert "Abrir job na UI" in message["html_body"]
 
 
+def test_email_submitter_is_used_as_recipient():
+    message = email_notification_service.build_job_status_email(
+        job_id="job-1",
+        status=JobStatus.QUEUED.value,
+        previous_status=JobStatus.LAUNCHING.value,
+        job={
+            "job_name": "Queued demo",
+            "submitted_by": "tiago@energaize.io",
+        },
+    )
+
+    assert message is not None
+    assert message["to"] == ["tiago@energaize.io"]
+
+
 def test_write_status_publishes_once_for_real_transition(monkeypatch, jobs_env):
     monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFICATIONS_ENABLED", True)
     monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFY_STATUSES", [JobStatus.QUEUED.value])
@@ -89,3 +106,49 @@ def test_write_status_publishes_once_for_real_transition(monkeypatch, jobs_env):
     payload = json.loads(json.dumps(published[0]))
     assert payload["to"] == ["calof@isep.ipp.pt"]
     assert payload["subject"] == "[EnergAIze] Job queued: Queued demo"
+
+
+def test_publish_email_request_declares_queue_and_requires_routing(monkeypatch):
+    calls: list[tuple[str, dict]] = []
+
+    class FakeUnroutableError(Exception):
+        pass
+
+    class FakeChannel:
+        def queue_declare(self, **kwargs):
+            calls.append(("queue_declare", kwargs))
+
+        def confirm_delivery(self):
+            calls.append(("confirm_delivery", {}))
+
+        def basic_publish(self, **kwargs):
+            calls.append(("basic_publish", kwargs))
+
+    class FakeConnection:
+        def __init__(self, params):
+            calls.append(("connection", {"params": params}))
+
+        def channel(self):
+            return FakeChannel()
+
+        def close(self):
+            calls.append(("close", {}))
+
+    fake_pika = SimpleNamespace(
+        BasicProperties=lambda **kwargs: {"properties": kwargs},
+        BlockingConnection=FakeConnection,
+        ConnectionParameters=lambda **kwargs: {"connection": kwargs},
+        PlainCredentials=lambda username, password: {"username": username, "password": password},
+        exceptions=SimpleNamespace(UnroutableError=FakeUnroutableError),
+    )
+    monkeypatch.setitem(sys.modules, "pika", fake_pika)
+    monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_QUEUE", "email_requests")
+
+    email_notification_service._publish_email_request({"to": ["tiago@energaize.io"], "subject": "test", "body": "test"})
+
+    assert ("queue_declare", {"queue": "email_requests", "durable": True}) in calls
+    assert ("confirm_delivery", {}) in calls
+    publish_call = next(payload for name, payload in calls if name == "basic_publish")
+    assert publish_call["exchange"] == ""
+    assert publish_call["routing_key"] == "email_requests"
+    assert publish_call["mandatory"] is True
