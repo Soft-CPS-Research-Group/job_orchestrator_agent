@@ -82,6 +82,23 @@ def test_email_submitter_is_used_as_recipient():
     assert message["to"] == ["tiago@energaize.io"]
 
 
+def test_pedro_monteiro_submitter_uses_isep_recipient():
+    message = email_notification_service.build_job_status_email(
+        job_id="job-1",
+        status=JobStatus.QUEUED.value,
+        previous_status=JobStatus.LAUNCHING.value,
+        job={
+            "job_name": "Queued demo",
+            "submitted_by": "pedro monteiro",
+        },
+    )
+
+    assert email_notification_service.normalize_submitted_by("pedro monteiro") == "Pedro Monteiro"
+    assert message is not None
+    assert message["to"] == ["1211076@isep.ipp.pt"]
+    assert "Pedro Monteiro" in message["body"]
+
+
 def test_write_status_publishes_once_for_real_transition(monkeypatch, jobs_env):
     monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFICATIONS_ENABLED", True)
     monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFY_STATUSES", [JobStatus.QUEUED.value])

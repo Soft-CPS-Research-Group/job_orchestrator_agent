@@ -89,9 +89,11 @@ class Settings(BaseSettings):
         "tiago fonseca": "calof@isep.ipp.pt",
         "calof": "calof@isep.ipp.pt",
         "codex": "calof@isep.ipp.pt",
+        "pedro monteiro": "1211076@isep.ipp.pt",
     }
     JOB_EMAIL_SUBMITTER_NAMES: dict[str, str] = {
         "codex": "Tiago Fonseca",
+        "pedro monteiro": "Pedro Monteiro",
     }
 
     MONGO_USER: str = "runtimeUI"
