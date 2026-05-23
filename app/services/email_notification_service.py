@@ -13,6 +13,11 @@ from app.config import settings
 _LOGGER = logging.getLogger(__name__)
 _EMAIL_ADDRESS_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
+
+def _email_debug(message: str) -> None:
+    print(f"[job-email] {message}", flush=True)
+
+
 _STATUS_LABELS = {
     "queued": "queued",
     "dispatched": "dispatched",
@@ -309,10 +314,13 @@ def notify_job_status_change(
     job: dict[str, Any],
 ) -> None:
     if not settings.JOB_EMAIL_NOTIFICATIONS_ENABLED:
+        _email_debug(f"skip job_id={job_id} status={status}: notifications disabled")
         return
     if previous_status == status:
+        _email_debug(f"skip job_id={job_id} status={status}: status did not change")
         return
     if not _status_is_notifiable(status):
+        _email_debug(f"skip job_id={job_id} status={status}: status is not notifiable")
         return
 
     message = build_job_status_email(
@@ -322,12 +330,28 @@ def notify_job_status_change(
         job=job,
     )
     if not message:
+        _email_debug(
+            f"skip job_id={job_id} status={status}: no recipient for submitted_by={job.get('submitted_by')!r}"
+        )
         _LOGGER.warning("Skipping job status email for %s: no recipient for submitter %r", job_id, job.get("submitted_by"))
         return
 
+    recipients = message.get("to") if isinstance(message.get("to"), list) else []
+    _email_debug(
+        "publish attempt "
+        f"job_id={job_id} status={status} previous_status={previous_status or '-'} "
+        f"submitted_by={job.get('submitted_by')!r} to={recipients} "
+        f"rabbit={settings.JOB_EMAIL_RABBITMQ_HOST}:{settings.JOB_EMAIL_RABBITMQ_PORT}/"
+        f"{settings.JOB_EMAIL_RABBITMQ_QUEUE} subject={message.get('subject')!r}"
+    )
     try:
         _publish_email_request(message)
-    except Exception:
+    except Exception as exc:
+        _email_debug(
+            "publish failed "
+            f"job_id={job_id} status={status} "
+            f"error={type(exc).__name__}: {exc}"
+        )
         _LOGGER.exception(
             "Failed to publish email notification for job %s status %s to RabbitMQ %s:%s/%s",
             job_id,
@@ -338,4 +362,5 @@ def notify_job_status_change(
         )
         return
 
+    _email_debug(f"publish ok job_id={job_id} status={status} to={recipients}")
     _LOGGER.info("Published email notification for job %s status %s at %.3f", job_id, status, time.time())
