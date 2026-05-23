@@ -82,21 +82,31 @@ def test_email_submitter_is_used_as_recipient():
     assert message["to"] == ["tiago@energaize.io"]
 
 
-def test_pedro_monteiro_submitter_uses_isep_recipient():
+@pytest.mark.parametrize(
+    ("submitted_by", "display_name", "recipient"),
+    [
+        ("pedro monteiro", "Pedro Monteiro", "1211076@isep.ipp.pt"),
+        ("Pedro Alves Monteiro", "Pedro Alves Monteiro", "1211076@isep.ipp.pt"),
+        ("pedro.monteiro@energaize.io", "Pedro Alves Monteiro", "1211076@isep.ipp.pt"),
+        ("Gustavo Nuno Chaves Jorge", "Gustavo Nuno Chaves Jorge", "1211061@isep.ipp.pt"),
+        ("gustavo.jorge@energaize.io", "Gustavo Nuno Chaves Jorge", "1211061@isep.ipp.pt"),
+    ],
+)
+def test_known_ui_submitters_use_isep_recipients(submitted_by, display_name, recipient):
     message = email_notification_service.build_job_status_email(
         job_id="job-1",
         status=JobStatus.QUEUED.value,
         previous_status=JobStatus.LAUNCHING.value,
         job={
             "job_name": "Queued demo",
-            "submitted_by": "pedro monteiro",
+            "submitted_by": submitted_by,
         },
     )
 
-    assert email_notification_service.normalize_submitted_by("pedro monteiro") == "Pedro Monteiro"
+    assert email_notification_service.normalize_submitted_by(submitted_by) == display_name
     assert message is not None
-    assert message["to"] == ["1211076@isep.ipp.pt"]
-    assert "Pedro Monteiro" in message["body"]
+    assert message["to"] == [recipient]
+    assert display_name in message["body"]
 
 
 def test_write_status_publishes_once_for_real_transition(monkeypatch, jobs_env):

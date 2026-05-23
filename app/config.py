@@ -90,10 +90,22 @@ class Settings(BaseSettings):
         "calof": "calof@isep.ipp.pt",
         "codex": "calof@isep.ipp.pt",
         "pedro monteiro": "1211076@isep.ipp.pt",
+        "pedro alves monteiro": "1211076@isep.ipp.pt",
+        "pedro.monteiro@energaize.io": "1211076@isep.ipp.pt",
+        "gustavo": "1211061@isep.ipp.pt",
+        "gustavo jorge": "1211061@isep.ipp.pt",
+        "gustavo nuno chaves jorge": "1211061@isep.ipp.pt",
+        "gustavo.jorge@energaize.io": "1211061@isep.ipp.pt",
     }
     JOB_EMAIL_SUBMITTER_NAMES: dict[str, str] = {
         "codex": "Tiago Fonseca",
         "pedro monteiro": "Pedro Monteiro",
+        "pedro alves monteiro": "Pedro Alves Monteiro",
+        "pedro.monteiro@energaize.io": "Pedro Alves Monteiro",
+        "gustavo": "Gustavo Nuno Chaves Jorge",
+        "gustavo jorge": "Gustavo Nuno Chaves Jorge",
+        "gustavo nuno chaves jorge": "Gustavo Nuno Chaves Jorge",
+        "gustavo.jorge@energaize.io": "Gustavo Nuno Chaves Jorge",
     }
 
     MONGO_USER: str = "runtimeUI"
