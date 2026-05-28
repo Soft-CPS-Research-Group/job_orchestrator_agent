@@ -45,6 +45,8 @@ are documented in `docs/jobs.md`.
   payloads. The orchestrator also accepts `worker_version` on every
   `/api/agent/job-status` request and exposes the latest status publication
   version in `/hosts` as `info.worker_version` and `info.last_status_worker_version`.
+- For Deucalion, `/hosts` also exposes `info.partition_limits`; UI clients can
+  use this to keep Slurm walltime controls aligned with server validation.
 - Hosts are reported as `online` if a heartbeat was received within
   `HOST_HEARTBEAT_TTL` seconds (default 60). Offline hosts remain visible so
   queued jobs can be inspected even if the worker is disconnected.

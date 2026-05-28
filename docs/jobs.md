@@ -105,6 +105,7 @@ Repeated updates with the same status are accepted (idempotent).
 - `GET /jobs` (all jobs)
 - `GET /queue` (queue entries)
 - `GET /hosts` (worker health snapshot)
+- `GET /deucalion/partitions` (Deucalion partition walltime limits)
 - `GET /logs/{job_id}` (stream)
 - `GET /file-logs/{job_id}` (file stream)
 - `GET /progress/{job_id}`
@@ -214,6 +215,9 @@ root is mounted at `/data`.
   CPU job and one active GPU job can be dispatched/taken at the same time.
   Additional Deucalion jobs remain queued until the corresponding profile slot
   is free.
+- Deucalion launch requests are validated against the published Slurm partition
+  walltime limits. Current limits are exposed by `GET /deucalion/partitions`
+  and in `/hosts -> hosts.deucalion.info.partition_limits`.
 
 ### Idempotency
 - Status updates with the same state are accepted. Invalid transitions return

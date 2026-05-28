@@ -48,6 +48,9 @@ def get_file_logs(job_id: str):
 def get_hosts():
     return job_service.get_hosts()
 
+def get_deucalion_partition_limits():
+    return job_service.get_deucalion_partition_limits()
+
 def get_job_resolved_config(job_id: str):
     return job_service.get_job_resolved_config(job_id)
 

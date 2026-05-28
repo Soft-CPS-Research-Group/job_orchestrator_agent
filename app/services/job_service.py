@@ -49,6 +49,7 @@ DEFAULT_JOB_CLEANUP_KEEP = {
     "failed_job",
     "queued_job",
 }
+EMAIL_NOTIFICATION_HISTORY_LIMIT = 20
 
 RUNTIME_RESET_FIELDS = {
     "container_id",
@@ -79,6 +80,23 @@ DEUCALION_SLURM_ACTIVE_STATES = {
     "STAGE_OUT",
     "RESIZING",
     "SUSPENDED",
+}
+
+DEUCALION_PARTITION_LIMIT_SOURCE = "https://docs.deucalion.macc.fccn.pt/jobs/#partitions-on-deucalion"
+DEUCALION_PARTITION_LIMITS = (
+    {"partition": "dev-arm", "architecture": "aarch64", "max_nodes": 2, "time_limit_seconds": 4 * 60 * 60},
+    {"partition": "normal-arm", "architecture": "aarch64", "max_nodes": 128, "time_limit_seconds": 48 * 60 * 60},
+    {"partition": "large-arm", "architecture": "aarch64", "max_nodes": 512, "time_limit_seconds": 72 * 60 * 60},
+    {"partition": "dev-x86", "architecture": "x86_64", "max_nodes": 2, "time_limit_seconds": 4 * 60 * 60},
+    {"partition": "normal-x86", "architecture": "x86_64", "max_nodes": 64, "time_limit_seconds": 48 * 60 * 60},
+    {"partition": "large-x86", "architecture": "x86_64", "max_nodes": 128, "time_limit_seconds": 72 * 60 * 60},
+    {"partition": "dev-a100-40", "architecture": "x86_64", "max_nodes": 1, "time_limit_seconds": 4 * 60 * 60},
+    {"partition": "normal-a100-40", "architecture": "x86_64", "max_nodes": 4, "time_limit_seconds": 48 * 60 * 60},
+    {"partition": "dev-a100-80", "architecture": "x86_64", "max_nodes": 1, "time_limit_seconds": 4 * 60 * 60},
+    {"partition": "normal-a100-80", "architecture": "x86_64", "max_nodes": 4, "time_limit_seconds": 48 * 60 * 60},
+)
+DEUCALION_PARTITION_LIMITS_BY_NAME = {
+    row["partition"]: row for row in DEUCALION_PARTITION_LIMITS
 }
 
 _image_versions_cache: dict[str, dict] = {}
@@ -386,18 +404,56 @@ def _status_notification_meta(job_id: str, status: str) -> dict[str, Any]:
     return meta
 
 
+def _append_email_notification_record(job_id: str, record: dict[str, Any] | None) -> None:
+    if not record:
+        return
+
+    meta = dict(jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {})
+    existing = meta.get("email_notifications")
+    history = list(existing) if isinstance(existing, list) else []
+    history.append(record)
+    history = history[-EMAIL_NOTIFICATION_HISTORY_LIMIT:]
+
+    if meta:
+        meta["last_email_notification"] = record
+        meta["email_notifications"] = history
+        _persist_job(job_id, meta)
+
+    status_payload = _read_status_payload(job_id)
+    if status_payload:
+        status = str(status_payload.get("status") or meta.get("status") or JobStatus.UNKNOWN.value)
+        extra = {key: value for key, value in status_payload.items() if key not in {"job_id", "status"}}
+        extra["last_email_notification"] = record
+        extra["email_notifications"] = history
+        job_utils.write_status_file(job_id, status, extra)
+
+    info_path = _info_path(job_id)
+    if os.path.exists(info_path):
+        try:
+            info = _read_job_info_payload(job_id)
+            info["last_email_notification"] = record
+            info["email_notifications"] = history
+            with open(info_path, "w") as handle:
+                json.dump(info, handle, indent=2)
+        except Exception:
+            _LOGGER.warning("Failed to persist email notification metadata for job %s", job_id, exc_info=True)
+
+
 def _notify_status_change(job_id: str, previous_status: str | None, status: str) -> None:
-    email_notification_service.notify_job_status_change(
+    record = email_notification_service.notify_job_status_change(
         job_id=job_id,
         previous_status=previous_status,
         status=status,
         job=_status_notification_meta(job_id, status),
     )
+    _append_email_notification_record(job_id, record)
+
 
 
 def _write_status(job_id: str, status: str, extra: dict | None = None):
     """Persist status to disk and update the in-memory jobs cache."""
-    prev = _read_status_file(job_id)
+    previous_payload = _read_status_payload(job_id) or {}
+    prev = previous_payload.get("status") or _read_status_file(job_id)
     if prev and prev != status and not can_transition(prev, status):
         _LOGGER.error("Invalid status transition for job %s: %s -> %s", job_id, prev, status)
         raise ValueError(f"Invalid status transition {prev} -> {status}")
@@ -410,6 +466,9 @@ def _write_status(job_id: str, status: str, extra: dict | None = None):
     )
     status_ts = time.time()
     extra_payload = dict(extra or {})
+    for key in ("last_email_notification", "email_notifications"):
+        if key not in extra_payload and key in previous_payload:
+            extra_payload[key] = previous_payload[key]
     extra_payload.setdefault("status_updated_at", status_ts)
     extra_payload.setdefault("last_status_at", status_ts)
     job_utils.write_status_file(job_id, status, extra_payload)
@@ -430,9 +489,13 @@ def _write_status(job_id: str, status: str, extra: dict | None = None):
 
 def _force_status(job_id: str, status: str, extra: dict | None = None) -> None:
     """Write status without enforcing state transitions (ops override)."""
-    prev = _read_status_file(job_id)
+    previous_payload = _read_status_payload(job_id) or {}
+    prev = previous_payload.get("status") or _read_status_file(job_id)
     status_ts = time.time()
     extra_payload = dict(extra or {})
+    for key in ("last_email_notification", "email_notifications"):
+        if key not in extra_payload and key in previous_payload:
+            extra_payload[key] = previous_payload[key]
     extra_payload.setdefault("status_updated_at", status_ts)
     extra_payload.setdefault("last_status_at", status_ts)
     job_utils.write_status_file(job_id, status, extra_payload)
@@ -476,6 +539,122 @@ def _is_gpu_like_partition(value: Any) -> bool:
     if not normalized:
         return False
     return "gpu" in normalized or "a100" in normalized or "h100" in normalized
+
+
+def _format_duration_hours(seconds: int) -> str:
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def _format_duration_label(seconds: int) -> str:
+    hours = seconds // 3600
+    if seconds % 3600 == 0:
+        return f"{hours} hour" if hours == 1 else f"{hours} hours"
+    return _format_duration_hours(seconds)
+
+
+def _parse_slurm_time_limit_seconds(value: Any) -> int:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        raise ValueError("time limit is empty")
+
+    days = 0
+    time_part = text
+    has_day_prefix = "-" in text
+    if has_day_prefix:
+        day_part, time_part = text.split("-", 1)
+        if not day_part.isdigit() or not time_part:
+            raise ValueError("invalid Slurm time format")
+        days = int(day_part)
+
+    parts = time_part.split(":")
+    if not 1 <= len(parts) <= 3 or any(not part.isdigit() for part in parts):
+        raise ValueError("invalid Slurm time format")
+
+    values = [int(part) for part in parts]
+    if has_day_prefix:
+        hours = values[0]
+        minutes = values[1] if len(values) >= 2 else 0
+        seconds = values[2] if len(values) >= 3 else 0
+    elif len(values) == 1:
+        hours = 0
+        minutes = values[0]
+        seconds = 0
+    elif len(values) == 2:
+        hours = 0
+        minutes, seconds = values
+    else:
+        hours, minutes, seconds = values
+
+    if minutes >= 60 or seconds >= 60:
+        raise ValueError("minutes and seconds must be below 60")
+    total = days * 24 * 3600 + hours * 3600 + minutes * 60 + seconds
+    if total <= 0:
+        raise ValueError("time limit must be greater than zero")
+    return total
+
+
+def get_deucalion_partition_limits() -> dict:
+    partitions = []
+    for row in DEUCALION_PARTITION_LIMITS:
+        seconds = int(row["time_limit_seconds"])
+        partitions.append(
+            {
+                **row,
+                "time_limit": _format_duration_hours(seconds),
+                "time_limit_label": _format_duration_label(seconds),
+            }
+        )
+    return {
+        "source": DEUCALION_PARTITION_LIMIT_SOURCE,
+        "partitions": partitions,
+    }
+
+
+def _validate_deucalion_walltime_options(options: dict | None) -> None:
+    if not options:
+        return
+    partition_raw = options.get("partition")
+    partition = str(partition_raw).strip().lower() if partition_raw is not None else ""
+    if partition:
+        limit = DEUCALION_PARTITION_LIMITS_BY_NAME.get(partition)
+        if limit is None:
+            allowed = ", ".join(row["partition"] for row in DEUCALION_PARTITION_LIMITS)
+            raise HTTPException(400, f"Unknown Deucalion partition '{partition_raw}'. Allowed: {allowed}")
+        options["partition"] = partition
+    else:
+        limit = None
+
+    time_limit = options.get("time") or options.get("time_limit")
+    if time_limit is None:
+        return
+
+    try:
+        requested_seconds = _parse_slurm_time_limit_seconds(time_limit)
+    except ValueError as exc:
+        raise HTTPException(
+            400,
+            (
+                "Invalid deucalion_options.time. Use Slurm time format such as "
+                "04:00:00, 2-00:00:00, or minutes."
+            ),
+        ) from exc
+
+    if limit is None:
+        return
+
+    max_seconds = int(limit["time_limit_seconds"])
+    if requested_seconds > max_seconds:
+        max_label = _format_duration_label(max_seconds)
+        raise HTTPException(
+            400,
+            (
+                f"deucalion_options.time exceeds the {max_label} walltime limit "
+                f"for partition '{partition}'"
+            ),
+        )
 
 
 def _payload_indicates_gpu(payload: Any) -> bool:
@@ -1143,6 +1322,7 @@ def _host_status_snapshot() -> dict[str, dict]:
             normalized_info["max_active_jobs_by_profile"] = profile_limits
             normalized_info["active_job_count_by_profile"] = profile_counts
             normalized_info["active_job_ids_by_profile"] = profile_active_ids
+            normalized_info["partition_limits"] = get_deucalion_partition_limits()
             normalized_info["active_job_count"] = sum(profile_counts.values())
         if normalized_info["active_job_count"] is None:
             normalized_info["active_job_count"] = len(merged_active_ids)
@@ -1326,6 +1506,7 @@ async def launch_simulation(request: JobLaunchRequest):
     )
     if deucalion_options and preferred_host != "deucalion":
         raise HTTPException(400, "deucalion_options are only allowed when target_host is 'deucalion'")
+    _validate_deucalion_walltime_options(deucalion_options)
 
     if not config_path.startswith("configs/"):
         config_path = f"configs/{config_path}"
@@ -1617,6 +1798,8 @@ def list_jobs():
         info.setdefault("image_tag", merged.get("image_tag"))
         info.setdefault("deucalion_options", merged.get("deucalion_options"))
         info.setdefault("image", merged.get("image") or settings.DEFAULT_JOB_IMAGE)
+        info.setdefault("last_email_notification", merged.get("last_email_notification"))
+        info.setdefault("email_notifications", merged.get("email_notifications"))
 
         status_payload = get_status(job_id)
         status = status_payload["status"]
@@ -1688,6 +1871,10 @@ def get_job_info(job_id: str):
         info["image_tag"] = meta.get("image_tag")
     if not info.get("deucalion_options"):
         info["deucalion_options"] = meta.get("deucalion_options")
+    if "last_email_notification" not in info and meta.get("last_email_notification"):
+        info["last_email_notification"] = meta.get("last_email_notification")
+    if "email_notifications" not in info and meta.get("email_notifications"):
+        info["email_notifications"] = meta.get("email_notifications")
 
     # Expose lifecycle timing in job details overview.
     durations = _compute_job_durations(meta) if meta else {}

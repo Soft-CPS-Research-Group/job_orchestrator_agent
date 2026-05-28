@@ -33,6 +33,7 @@ Job clients use this service for:
 - `/stop/{job_id}`, `/job/{job_id}`
 - `/job-resolved-config/{job_id}`
 - `/job-images/versions`
+- `/deucalion/partitions`
 - `/experiment-config*`
 - `/dataset`, `/datasets`, `/datasets/generate`, `/dataset/upload`, `/dataset/download/{name}`
 - `/dataset/sites`, `/dataset/dates-available/{site_id}`

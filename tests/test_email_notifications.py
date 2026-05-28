@@ -134,6 +134,42 @@ def test_write_status_publishes_once_for_real_transition(monkeypatch, jobs_env):
     assert payload["to"] == ["calof@isep.ipp.pt"]
     assert payload["subject"] == "[EnergAIze] Job queued: Queued demo"
 
+    status_payload = job_service.get_status(job_id)
+    email_record = status_payload["last_email_notification"]
+    assert email_record["outcome"] == "published"
+    assert email_record["recipients"] == ["calof@isep.ipp.pt"]
+    assert len(status_payload["email_notifications"]) == 1
+
+    tracked = job_utils.load_jobs()[job_id]
+    assert tracked["last_email_notification"]["subject"] == "[EnergAIze] Job queued: Queued demo"
+
+
+def test_write_status_records_failed_email_publish(monkeypatch, jobs_env):
+    monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFICATIONS_ENABLED", True)
+    monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFY_STATUSES", [JobStatus.QUEUED.value])
+
+    def fail_publish(_message):
+        raise RuntimeError("rabbit down")
+
+    monkeypatch.setattr(email_notification_service, "_publish_email_request", fail_publish)
+
+    job_id = "job-1"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "job_name": "Queued demo",
+        "status": JobStatus.LAUNCHING.value,
+        "submitted_by": "Tiago Fonseca",
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+
+    job_service._write_status(job_id, JobStatus.QUEUED.value)
+
+    email_record = job_service.get_status(job_id)["last_email_notification"]
+    assert email_record["attempted"] is True
+    assert email_record["outcome"] == "failed"
+    assert email_record["recipients"] == ["calof@isep.ipp.pt"]
+    assert "rabbit down" in email_record["error"]
+
 
 def test_publish_email_request_declares_queue_and_requires_routing(monkeypatch):
     calls: list[tuple[str, dict]] = []

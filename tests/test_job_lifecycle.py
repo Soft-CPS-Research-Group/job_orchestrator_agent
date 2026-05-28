@@ -276,6 +276,66 @@ def test_deucalion_dispatch_limits_one_active_cpu_and_gpu():
     assert deucalion["info"]["active_job_count_by_profile"] == {"cpu": 1, "gpu": 1}
     assert deucalion["info"]["active_job_ids_by_profile"]["cpu"] == [cpu_one["job_id"]]
     assert deucalion["info"]["active_job_ids_by_profile"]["gpu"] == [gpu_one["job_id"]]
+    limits = deucalion["info"]["partition_limits"]
+    normal_x86 = next(row for row in limits["partitions"] if row["partition"] == "normal-x86")
+    assert limits["source"].startswith("https://docs.deucalion.macc.fccn.pt/")
+    assert normal_x86["time_limit_seconds"] == 48 * 60 * 60
+
+
+def test_launch_deucalion_rejects_walltime_above_partition_limit():
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={"experiment": {"name": "Deucalion", "run_name": "TooLong"}},
+                    target_host="deucalion",
+                    deucalion_options={"partition": "normal-x86", "time": "49:00:00"},
+                )
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "48 hours" in str(exc.value.detail)
+
+
+def test_launch_deucalion_allows_large_partition_walltime():
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Deucalion", "run_name": "Large"}},
+                target_host="deucalion",
+                deucalion_options={"partition": "large-x86", "time": "72:00:00"},
+            )
+        )
+    )
+
+    dispatched = job_service.agent_next_job("deucalion")
+    assert dispatched is not None
+    assert dispatched["job_id"] == result["job_id"]
+    assert dispatched["deucalion_options"]["partition"] == "large-x86"
+    assert dispatched["deucalion_options"]["time"] == "72:00:00"
+
+
+def test_launch_deucalion_rejects_unknown_partition():
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={"experiment": {"name": "Deucalion", "run_name": "BadPartition"}},
+                    target_host="deucalion",
+                    deucalion_options={"partition": "debug-x86", "time": "01:00:00"},
+                )
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "Unknown Deucalion partition" in str(exc.value.detail)
 
 
 def test_launch_writes_resolved_config_with_container_dataset_path():

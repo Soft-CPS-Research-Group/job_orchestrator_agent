@@ -523,6 +523,17 @@ def test_hosts_include_active_job_ids_and_current_job(api_client, monkeypatch):
     assert isinstance(row["info"]["last_status_at"], (int, float))
 
 
+def test_deucalion_partitions_endpoint(api_client):
+    resp = api_client.get("/deucalion/partitions")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["source"].startswith("https://docs.deucalion.macc.fccn.pt/")
+    partitions = {entry["partition"]: entry for entry in payload["partitions"]}
+    assert partitions["normal-x86"]["time_limit_seconds"] == 48 * 60 * 60
+    assert partitions["large-x86"]["time_limit_seconds"] == 72 * 60 * 60
+    assert partitions["dev-a100-40"]["time_limit_seconds"] == 4 * 60 * 60
+
+
 def test_job_image_versions_endpoint(api_client, monkeypatch):
     from app.services import job_service
 

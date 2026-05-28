@@ -312,16 +312,16 @@ def notify_job_status_change(
     previous_status: str | None,
     status: str,
     job: dict[str, Any],
-) -> None:
+) -> dict[str, Any] | None:
     if not settings.JOB_EMAIL_NOTIFICATIONS_ENABLED:
         _email_debug(f"skip job_id={job_id} status={status}: notifications disabled")
-        return
+        return None
     if previous_status == status:
         _email_debug(f"skip job_id={job_id} status={status}: status did not change")
-        return
+        return None
     if not _status_is_notifiable(status):
         _email_debug(f"skip job_id={job_id} status={status}: status is not notifiable")
-        return
+        return None
 
     message = build_job_status_email(
         job_id=job_id,
@@ -329,14 +329,40 @@ def notify_job_status_change(
         previous_status=previous_status,
         job=job,
     )
+    attempted_at = time.time()
+    base_record: dict[str, Any] = {
+        "job_id": job_id,
+        "status": status,
+        "previous_status": previous_status,
+        "attempted_at": attempted_at,
+        "submitted_by": job.get("submitted_by"),
+        "attempted": False,
+        "published": False,
+        "outcome": "skipped",
+        "recipients": [],
+        "subject": None,
+        "rabbitmq": {
+            "host": settings.JOB_EMAIL_RABBITMQ_HOST,
+            "port": int(settings.JOB_EMAIL_RABBITMQ_PORT),
+            "queue": settings.JOB_EMAIL_RABBITMQ_QUEUE,
+        },
+    }
     if not message:
         _email_debug(
             f"skip job_id={job_id} status={status}: no recipient for submitted_by={job.get('submitted_by')!r}"
         )
         _LOGGER.warning("Skipping job status email for %s: no recipient for submitter %r", job_id, job.get("submitted_by"))
-        return
+        base_record["reason"] = "no_recipient"
+        return base_record
 
     recipients = message.get("to") if isinstance(message.get("to"), list) else []
+    base_record.update(
+        {
+            "attempted": True,
+            "recipients": [str(recipient) for recipient in recipients],
+            "subject": str(message.get("subject") or ""),
+        }
+    )
     _email_debug(
         "publish attempt "
         f"job_id={job_id} status={status} previous_status={previous_status or '-'} "
@@ -360,7 +386,22 @@ def notify_job_status_change(
             settings.JOB_EMAIL_RABBITMQ_PORT,
             settings.JOB_EMAIL_RABBITMQ_QUEUE,
         )
-        return
+        base_record.update(
+            {
+                "outcome": "failed",
+                "reason": "publish_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        )
+        return base_record
 
     _email_debug(f"publish ok job_id={job_id} status={status} to={recipients}")
     _LOGGER.info("Published email notification for job %s status %s at %.3f", job_id, status, time.time())
+    base_record.update(
+        {
+            "published": True,
+            "outcome": "published",
+            "reason": "published",
+        }
+    )
+    return base_record
