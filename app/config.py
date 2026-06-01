@@ -69,8 +69,8 @@ class Settings(BaseSettings):
     JOB_EMAIL_RABBITMQ_HOST: str = "rabbitmq"
     JOB_EMAIL_RABBITMQ_PORT: int = 5672
     JOB_EMAIL_RABBITMQ_QUEUE: str = "email_requests"
-    JOB_EMAIL_RABBITMQ_USERNAME: str | None = None
-    JOB_EMAIL_RABBITMQ_PASSWORD: str | None = None
+    JOB_EMAIL_RABBITMQ_USERNAME: str | None = "calof"
+    JOB_EMAIL_RABBITMQ_PASSWORD: str | None = "calof"
     JOB_EMAIL_RABBITMQ_VHOST: str = "/"
     JOB_EMAIL_RABBITMQ_SOCKET_TIMEOUT_SECONDS: float = 2.0
     JOB_EMAIL_REPLY_TO: str | None = None

@@ -243,8 +243,8 @@ def test_publish_email_request_declares_queue_and_requires_routing(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "pika", fake_pika)
     monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_QUEUE", "email_requests")
-    monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_USERNAME", None)
-    monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_PASSWORD", None)
+    monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_USERNAME", "calof")
+    monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_PASSWORD", "calof")
 
     email_notification_service._publish_email_request({"to": ["tiago@energaize.io"], "subject": "test", "body": "test"})
 
@@ -252,7 +252,7 @@ def test_publish_email_request_declares_queue_and_requires_routing(monkeypatch):
     connection_params = connection_call["params"]["connection"]
     assert connection_params["host"] == "rabbitmq"
     assert connection_params["port"] == 5672
-    assert "credentials" not in connection_params
+    assert connection_params["credentials"] == {"username": "calof", "password": "calof"}
     assert ("queue_declare", {"queue": "email_requests", "durable": True}) in calls
     assert ("confirm_delivery", {}) in calls
     publish_call = next(payload for name, payload in calls if name == "basic_publish")
