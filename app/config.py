@@ -66,8 +66,8 @@ class Settings(BaseSettings):
     UI_LINK_NETWORK_NOTICE: str | None = "Este link so abre se estiveres ligado a VPN/rede ISEP."
 
     JOB_EMAIL_NOTIFICATIONS_ENABLED: bool = True
-    JOB_EMAIL_RABBITMQ_HOST: str = "smtp-service"
-    JOB_EMAIL_RABBITMQ_PORT: int = 8016
+    JOB_EMAIL_RABBITMQ_HOST: str = "rabbitmq"
+    JOB_EMAIL_RABBITMQ_PORT: int = 5672
     JOB_EMAIL_RABBITMQ_QUEUE: str = "email_requests"
     JOB_EMAIL_RABBITMQ_USERNAME: str | None = None
     JOB_EMAIL_RABBITMQ_PASSWORD: str | None = None

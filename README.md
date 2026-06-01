@@ -100,8 +100,8 @@ Common environment variables:
 | `UI_BASE_URL` | `http://193.136.62.78:3000` | Public frontend base URL used in job notification emails. Leave unset to omit the UI link. |
 | `UI_LINK_NETWORK_NOTICE` | VPN/ISEP notice | Notice shown next to UI links in job notification emails. |
 | `JOB_EMAIL_NOTIFICATIONS_ENABLED` | `true` | Enables RabbitMQ job status emails. |
-| `JOB_EMAIL_RABBITMQ_HOST` | `smtp-service` | RabbitMQ host for email requests. |
-| `JOB_EMAIL_RABBITMQ_PORT` | `8016` | RabbitMQ port for email requests. |
+| `JOB_EMAIL_RABBITMQ_HOST` | `rabbitmq` | RabbitMQ host for email requests inside the OPEVA Docker network. Use `localhost` or the broker address when running outside Docker. |
+| `JOB_EMAIL_RABBITMQ_PORT` | `5672` | RabbitMQ AMQP port for email requests. |
 | `JOB_EMAIL_RABBITMQ_QUEUE` | `email_requests` | Queue receiving email request JSON messages. |
 | `JOB_EMAIL_NOTIFY_STATUSES` | `queued,dispatched,running,stop_requested,finished,failed,stopped,canceled` | Job statuses that trigger emails. |
 | `JOB_EMAIL_SUBMITTER_EMAILS` | Tiago/Codex to `calof@isep.ipp.pt`; Pedro to `1211076@isep.ipp.pt`; Gustavo to `1211061@isep.ipp.pt` | Submitter-to-recipient map used in job status emails. Accepts JSON or `name=email,name2=email2`. |

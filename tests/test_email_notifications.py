@@ -249,7 +249,10 @@ def test_publish_email_request_declares_queue_and_requires_routing(monkeypatch):
     email_notification_service._publish_email_request({"to": ["tiago@energaize.io"], "subject": "test", "body": "test"})
 
     connection_call = next(payload for name, payload in calls if name == "connection")
-    assert "credentials" not in connection_call["params"]["connection"]
+    connection_params = connection_call["params"]["connection"]
+    assert connection_params["host"] == "rabbitmq"
+    assert connection_params["port"] == 5672
+    assert "credentials" not in connection_params
     assert ("queue_declare", {"queue": "email_requests", "durable": True}) in calls
     assert ("confirm_delivery", {}) in calls
     publish_call = next(payload for name, payload in calls if name == "basic_publish")
