@@ -104,7 +104,7 @@ Common environment variables:
 | `JOB_EMAIL_RABBITMQ_PORT` | `8016` | RabbitMQ port for email requests. |
 | `JOB_EMAIL_RABBITMQ_QUEUE` | `email_requests` | Queue receiving email request JSON messages. |
 | `JOB_EMAIL_NOTIFY_STATUSES` | `queued,dispatched,running,stop_requested,finished,failed,stopped,canceled` | Job statuses that trigger emails. |
-| `JOB_EMAIL_SUBMITTER_EMAILS` | Tiago/Codex to `calof@isep.ipp.pt`; Pedro to `1211076@isep.ipp.pt`; Gustavo to `1211061@isep.ipp.pt` | Submitter-to-recipient map. Accepts JSON or `name=email,name2=email2`. |
+| `JOB_EMAIL_SUBMITTER_EMAILS` | Tiago/Codex to `calof@isep.ipp.pt`; Pedro to `1211076@isep.ipp.pt`; Gustavo to `1211061@isep.ipp.pt` | Submitter-to-recipient map used in job status emails. Accepts JSON or `name=email,name2=email2`. |
 | `JOB_EMAIL_SUBMITTER_NAMES` | Codex, Pedro and Gustavo aliases | Submitter display-name aliases used in job metadata and emails. |
 | `MONGO_*` | existing OPEVA defaults | Mongo connection used by dataset generation. |
 

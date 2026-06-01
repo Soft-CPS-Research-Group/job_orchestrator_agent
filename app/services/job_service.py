@@ -50,6 +50,7 @@ DEFAULT_JOB_CLEANUP_KEEP = {
     "queued_job",
 }
 EMAIL_NOTIFICATION_HISTORY_LIMIT = 20
+EMAIL_NOTIFICATION_METADATA_KEYS = {"last_email_notification", "email_notifications"}
 
 RUNTIME_RESET_FIELDS = {
     "container_id",
@@ -394,6 +395,10 @@ def _compute_job_durations(meta: dict, now_ts: float | None = None) -> dict:
     }
 
 
+def _without_email_notification_metadata(payload: dict) -> dict:
+    return {key: value for key, value in payload.items() if key not in EMAIL_NOTIFICATION_METADATA_KEYS}
+
+
 def _status_notification_meta(job_id: str, status: str) -> dict[str, Any]:
     meta = dict(jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {})
     status_payload = _read_status_payload(job_id) or {}
@@ -466,7 +471,7 @@ def _write_status(job_id: str, status: str, extra: dict | None = None):
     )
     status_ts = time.time()
     extra_payload = dict(extra or {})
-    for key in ("last_email_notification", "email_notifications"):
+    for key in EMAIL_NOTIFICATION_METADATA_KEYS:
         if key not in extra_payload and key in previous_payload:
             extra_payload[key] = previous_payload[key]
     extra_payload.setdefault("status_updated_at", status_ts)
@@ -493,7 +498,7 @@ def _force_status(job_id: str, status: str, extra: dict | None = None) -> None:
     prev = previous_payload.get("status") or _read_status_file(job_id)
     status_ts = time.time()
     extra_payload = dict(extra or {})
-    for key in ("last_email_notification", "email_notifications"):
+    for key in EMAIL_NOTIFICATION_METADATA_KEYS:
         if key not in extra_payload and key in previous_payload:
             extra_payload[key] = previous_payload[key]
     extra_payload.setdefault("status_updated_at", status_ts)
@@ -1798,8 +1803,7 @@ def list_jobs():
         info.setdefault("image_tag", merged.get("image_tag"))
         info.setdefault("deucalion_options", merged.get("deucalion_options"))
         info.setdefault("image", merged.get("image") or settings.DEFAULT_JOB_IMAGE)
-        info.setdefault("last_email_notification", merged.get("last_email_notification"))
-        info.setdefault("email_notifications", merged.get("email_notifications"))
+        info = _without_email_notification_metadata(info)
 
         status_payload = get_status(job_id)
         status = status_payload["status"]
@@ -1825,7 +1829,7 @@ def list_jobs():
                 "total_duration_seconds": durations.get("total_duration_seconds"),
                 "requeue_count": int(merged.get("requeue_count", 0) or 0),
                 "attempt_number": int(merged.get("attempt_number", 0) or 0),
-                "job_meta": merged,
+                "job_meta": _without_email_notification_metadata(merged),
             }
         )
     return result

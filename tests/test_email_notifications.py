@@ -1,5 +1,6 @@
 import json
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -144,6 +145,42 @@ def test_write_status_publishes_once_for_real_transition(monkeypatch, jobs_env):
     assert tracked["last_email_notification"]["subject"] == "[EnergAIze] Job queued: Queued demo"
 
 
+def test_email_notifications_stay_out_of_jobs_table_payload(monkeypatch, jobs_env):
+    monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFICATIONS_ENABLED", True)
+    monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFY_STATUSES", [JobStatus.QUEUED.value])
+    monkeypatch.setattr(email_notification_service, "_publish_email_request", lambda message: None)
+
+    job_id = "job-1"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "job_name": "Queued demo",
+        "status": JobStatus.LAUNCHING.value,
+        "submitted_by": "Tiago Fonseca",
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job_info.json").write_text(
+        json.dumps({"job_id": job_id, "job_name": "Queued demo"}),
+        encoding="utf-8",
+    )
+
+    job_service._write_status(job_id, JobStatus.QUEUED.value)
+
+    [entry] = [item for item in job_service.list_jobs() if item["job_id"] == job_id]
+    assert "last_email_notification" not in entry["job_info"]
+    assert "email_notifications" not in entry["job_info"]
+    assert "last_email_notification" not in entry["job_meta"]
+    assert "email_notifications" not in entry["job_meta"]
+
+    details = job_service.get_job_info(job_id)
+    status = job_service.get_status(job_id)
+    assert details["last_email_notification"]["outcome"] == "published"
+    assert len(details["email_notifications"]) == 1
+    assert status["last_email_notification"]["outcome"] == "published"
+
+
 def test_write_status_records_failed_email_publish(monkeypatch, jobs_env):
     monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFICATIONS_ENABLED", True)
     monkeypatch.setattr(settings, "JOB_EMAIL_NOTIFY_STATUSES", [JobStatus.QUEUED.value])
@@ -206,9 +243,13 @@ def test_publish_email_request_declares_queue_and_requires_routing(monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "pika", fake_pika)
     monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_QUEUE", "email_requests")
+    monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_USERNAME", None)
+    monkeypatch.setattr(settings, "JOB_EMAIL_RABBITMQ_PASSWORD", None)
 
     email_notification_service._publish_email_request({"to": ["tiago@energaize.io"], "subject": "test", "body": "test"})
 
+    connection_call = next(payload for name, payload in calls if name == "connection")
+    assert "credentials" not in connection_call["params"]["connection"]
     assert ("queue_declare", {"queue": "email_requests", "durable": True}) in calls
     assert ("confirm_delivery", {}) in calls
     publish_call = next(payload for name, payload in calls if name == "basic_publish")

@@ -274,17 +274,20 @@ def _publish_email_request(message: dict[str, Any]) -> None:
         )
 
     timeout = float(settings.JOB_EMAIL_RABBITMQ_SOCKET_TIMEOUT_SECONDS)
+    connection_params = {
+        "host": settings.JOB_EMAIL_RABBITMQ_HOST,
+        "port": int(settings.JOB_EMAIL_RABBITMQ_PORT),
+        "virtual_host": settings.JOB_EMAIL_RABBITMQ_VHOST,
+        "connection_attempts": 1,
+        "retry_delay": 0,
+        "socket_timeout": timeout,
+        "blocked_connection_timeout": timeout,
+    }
+    if credentials is not None:
+        connection_params["credentials"] = credentials
+
     connection = pika.BlockingConnection(
-        pika.ConnectionParameters(
-            host=settings.JOB_EMAIL_RABBITMQ_HOST,
-            port=int(settings.JOB_EMAIL_RABBITMQ_PORT),
-            virtual_host=settings.JOB_EMAIL_RABBITMQ_VHOST,
-            credentials=credentials,
-            connection_attempts=1,
-            retry_delay=0,
-            socket_timeout=timeout,
-            blocked_connection_timeout=timeout,
-        )
+        pika.ConnectionParameters(**connection_params)
     )
     try:
         channel = connection.channel()
