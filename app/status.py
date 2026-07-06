@@ -6,6 +6,7 @@ class JobStatus(str, Enum):
     LAUNCHING = "launching"      # created on server; preparing metadata
     QUEUED = "queued"            # written to /queue/<worker_id> but not yet taken
     DISPATCHED = "dispatched"    # agent popped from queue but not started yet
+    SETUP = "setup"              # worker accepted job and is preparing image/data/container
 
     # active
     RUNNING = "running"          # container started
@@ -26,7 +27,15 @@ class JobStatus(str, Enum):
 ALLOWED_TRANSITIONS = {
     JobStatus.LAUNCHING: {JobStatus.QUEUED, JobStatus.RUNNING, JobStatus.CANCELED},
     JobStatus.QUEUED: {JobStatus.DISPATCHED, JobStatus.CANCELED},
-    JobStatus.DISPATCHED: {JobStatus.RUNNING, JobStatus.FAILED, JobStatus.CANCELED, JobStatus.STOP_REQUESTED, JobStatus.QUEUED},
+    JobStatus.DISPATCHED: {
+        JobStatus.SETUP,
+        JobStatus.RUNNING,
+        JobStatus.FAILED,
+        JobStatus.CANCELED,
+        JobStatus.STOP_REQUESTED,
+        JobStatus.QUEUED,
+    },
+    JobStatus.SETUP: {JobStatus.RUNNING, JobStatus.FAILED, JobStatus.CANCELED, JobStatus.STOP_REQUESTED, JobStatus.QUEUED},
     JobStatus.RUNNING: {JobStatus.FINISHED, JobStatus.FAILED, JobStatus.STOP_REQUESTED, JobStatus.STOPPED, JobStatus.CANCELED},
     JobStatus.STOP_REQUESTED: {JobStatus.STOPPED, JobStatus.FAILED, JobStatus.CANCELED},
     JobStatus.FINISHED: set(),

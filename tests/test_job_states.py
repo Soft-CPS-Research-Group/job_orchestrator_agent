@@ -108,6 +108,9 @@ def test_get_status_remote_created(monkeypatch, jobs_env):
 def test_status_transition_helpers():
     assert can_transition(JobStatus.LAUNCHING, JobStatus.QUEUED)
     assert not can_transition(JobStatus.QUEUED, JobStatus.RUNNING)
+    assert can_transition(JobStatus.DISPATCHED, JobStatus.SETUP)
+    assert can_transition(JobStatus.SETUP, JobStatus.RUNNING)
+    assert can_transition(JobStatus.SETUP, JobStatus.QUEUED)
     assert can_transition(JobStatus.RUNNING, JobStatus.STOP_REQUESTED)
     assert can_transition(JobStatus.STOP_REQUESTED, JobStatus.STOPPED)
     assert can_transition(JobStatus.DISPATCHED, JobStatus.QUEUED)

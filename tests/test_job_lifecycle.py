@@ -1734,6 +1734,71 @@ def test_mark_stale_dispatched_requeues(monkeypatch):
     assert track[job_id]["status"] == JobStatus.QUEUED.value
 
 
+def test_mark_stale_setup_requeues_without_active_heartbeat(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a"]
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+
+    job_id = "job-stale-setup"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "preferred_host": "worker-a",
+        "require_host": True,
+        "status": JobStatus.SETUP.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    stale_ts = time.time() - 10
+    (job_dir / "status.json").write_text(
+        json.dumps({"job_id": job_id, "status": JobStatus.SETUP.value, "status_updated_at": stale_ts})
+    )
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.QUEUED.value
+    assert status_data["requeued_from"] == "worker-a"
+    assert (Path(settings.QUEUE_DIR) / f"{job_id}.json").exists()
+
+
+def test_mark_stale_setup_preserved_while_worker_heartbeat_reports_active(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a"]
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+
+    job_id = "job-active-setup"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "preferred_host": "worker-a",
+        "require_host": True,
+        "status": JobStatus.SETUP.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    stale_ts = time.time() - 10
+    (job_dir / "status.json").write_text(
+        json.dumps({"job_id": job_id, "status": JobStatus.SETUP.value, "status_updated_at": stale_ts})
+    )
+    job_service.host_heartbeats["worker-a"] = {
+        "last_seen": time.time(),
+        "info": {
+            "active_job_id": job_id,
+            "active_job_ids": [job_id],
+            "active_jobs": [{"job_id": job_id, "status": JobStatus.SETUP.value, "phase": "setup:image_pull"}],
+        },
+    }
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.SETUP.value
+    assert not (Path(settings.QUEUE_DIR) / f"{job_id}.json").exists()
+    track = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
+    assert track[job_id]["status"] == JobStatus.SETUP.value
+
+
 def test_mark_stale_running_fails(monkeypatch):
     settings.AVAILABLE_HOSTS = ["worker-a"]
     monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
@@ -1758,6 +1823,40 @@ def test_mark_stale_running_fails(monkeypatch):
     assert status_data["status"] == JobStatus.FAILED.value
     track = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
     assert track[job_id]["status"] == JobStatus.FAILED.value
+
+
+def test_mark_stale_running_preserved_while_worker_heartbeat_reports_active(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a"]
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+
+    job_id = "job-active-running-heartbeat"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "status": JobStatus.RUNNING.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    stale_ts = time.time() - 10
+    (job_dir / "status.json").write_text(
+        json.dumps({"job_id": job_id, "status": JobStatus.RUNNING.value, "status_updated_at": stale_ts})
+    )
+    job_service.host_heartbeats["worker-a"] = {
+        "last_seen": time.time(),
+        "info": {
+            "active_job_id": job_id,
+            "active_job_ids": [job_id],
+            "active_jobs": [{"job_id": job_id, "status": JobStatus.RUNNING.value, "phase": "running"}],
+        },
+    }
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.RUNNING.value
+    track = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
+    assert track[job_id]["status"] == JobStatus.RUNNING.value
 
 
 def test_mark_stale_deucalion_dispatched_pending_is_preserved(monkeypatch):

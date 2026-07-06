@@ -26,12 +26,14 @@ _LOGGER = logging.getLogger(__name__)
 
 CAPACITY_COUNT_STATUSES = {
     JobStatus.DISPATCHED.value,
+    JobStatus.SETUP.value,
     JobStatus.RUNNING.value,
     JobStatus.STOP_REQUESTED.value,
 }
 
 ACTIVE_JOB_STATUSES = {
     JobStatus.DISPATCHED.value,
+    JobStatus.SETUP.value,
     JobStatus.RUNNING.value,
     JobStatus.STOP_REQUESTED.value,
 }
@@ -67,6 +69,7 @@ RUNTIME_RESET_FIELDS = {
 ATTEMPT_LIFECYCLE_RESET_FIELDS = {
     "queued_at",
     "dispatched_at",
+    "setup_at",
     "started_at",
     "stop_requested_at",
     "finished_at",
@@ -520,6 +523,11 @@ def _apply_lifecycle_metadata(meta: dict, *, prev_status: str | None, status: st
             meta["attempt_number"] = int(meta.get("attempt_number", 0) or 0) + 1
         meta.setdefault("queued_at", status_ts)
         meta["dispatched_at"] = status_ts
+    elif status == JobStatus.SETUP.value:
+        meta.setdefault("queued_at", status_ts)
+        meta.setdefault("dispatched_at", status_ts)
+        meta["setup_at"] = status_ts
+        meta.pop("finished_at", None)
     elif status == JobStatus.RUNNING.value:
         meta.setdefault("queued_at", status_ts)
         meta.pop("finished_at", None)
@@ -626,7 +634,7 @@ def _repair_active_lifecycle_metadata(meta: dict) -> bool:
         elif has_stale_start:
             meta.pop("started_at", None)
             changed = True
-    elif status in {JobStatus.QUEUED.value, JobStatus.DISPATCHED.value} and has_stale_start:
+    elif status in {JobStatus.QUEUED.value, JobStatus.DISPATCHED.value, JobStatus.SETUP.value} and has_stale_start:
         meta.pop("started_at", None)
         changed = True
 
@@ -1962,6 +1970,35 @@ def _status_stale_ttl(meta: dict, status: str) -> int:
     return ttl
 
 
+def _should_preserve_heartbeat_active_status(job_id: str, meta: dict, now_ts: float) -> bool:
+    host = str(meta.get("target_host") or meta.get("preferred_host") or "")
+    if not host:
+        return False
+    hb = host_heartbeats.get(host)
+    if not hb:
+        return False
+    last_seen = hb.get("last_seen")
+    if not isinstance(last_seen, (int, float)):
+        return False
+    cutoff = settings.HOST_HEARTBEAT_TTL + settings.WORKER_STALE_GRACE_SECONDS
+    if (now_ts - float(last_seen)) > cutoff:
+        return False
+
+    info = hb.get("info")
+    if not isinstance(info, dict):
+        return False
+
+    active_jobs = _normalize_active_jobs_payload(info.get("active_jobs"))
+    if any(row.get("job_id") == job_id for row in active_jobs):
+        return True
+
+    active_job_ids = info.get("active_job_ids")
+    if isinstance(active_job_ids, list):
+        return job_id in {str(item) for item in active_job_ids if item is not None}
+
+    return info.get("active_job_id") == job_id
+
+
 def _should_preserve_deucalion_active_status(job_id: str, meta: dict, now_ts: float) -> bool:
     host = str(meta.get("target_host") or meta.get("preferred_host") or "")
     if host != "deucalion":
@@ -2297,22 +2334,22 @@ def _mark_stale_jobs():
     for job_id, meta in list(jobs.items()):
         status = meta.get("status")
         host = meta.get("target_host")
-        if status not in (JobStatus.DISPATCHED.value, JobStatus.RUNNING.value, JobStatus.STOP_REQUESTED.value):
+        if status not in ACTIVE_JOB_STATUSES:
             continue
 
         status_ttl = _status_stale_ttl(meta, status)
         last_update = _status_last_update(job_id)
         if last_update and (now - last_update) > status_ttl:
-            if _should_preserve_deucalion_active_status(job_id, meta, now):
+            if _should_preserve_heartbeat_active_status(job_id, meta, now) or _should_preserve_deucalion_active_status(job_id, meta, now):
                 _LOGGER.info(
-                    "Keeping %s Deucalion job %s while heartbeat/Slurm state is active",
+                    "Keeping %s job %s while worker heartbeat reports it active",
                     status,
                     job_id,
                 )
             else:
                 preferred = meta.get("preferred_host") or meta.get("target_host")
                 require_host = bool(meta.get("require_host", bool(preferred)))
-                if status == JobStatus.DISPATCHED.value:
+                if status in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value):
                     job_utils.enqueue_job(
                         _queue_payload(
                             job_id=job_id,
@@ -2350,7 +2387,7 @@ def _mark_stale_jobs():
             continue
         preferred = meta.get("preferred_host") or meta.get("target_host")
         require_host = bool(meta.get("require_host", bool(preferred)))
-        if status == JobStatus.DISPATCHED.value:
+        if status in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value):
             # Put back in queue for another worker to pick up
             job_utils.enqueue_job(
                 _queue_payload(
@@ -2579,6 +2616,7 @@ def get_logs(job_id: str):
         JobStatus.LAUNCHING.value,
         JobStatus.QUEUED.value,
         JobStatus.DISPATCHED.value,
+        JobStatus.SETUP.value,
         JobStatus.RUNNING.value,
         JobStatus.STOP_REQUESTED.value,
     }:
@@ -2632,6 +2670,7 @@ def get_logs_chunk(
         JobStatus.LAUNCHING.value,
         JobStatus.QUEUED.value,
         JobStatus.DISPATCHED.value,
+        JobStatus.SETUP.value,
         JobStatus.RUNNING.value,
         JobStatus.STOP_REQUESTED.value,
     }:
@@ -2667,7 +2706,7 @@ def stop_job(job_id: str, reason: str = "stop_requested", requested_by_ops: bool
             _persist_job(job_id, jobs[job_id])
         return {"message": "Job canceled from queue"}
 
-    if status_now in (JobStatus.DISPATCHED.value, JobStatus.RUNNING.value):
+    if status_now in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value, JobStatus.RUNNING.value):
         extra = {"stop_requested": True, "stop_reason": reason}
         if requested_by_ops:
             extra["stopped_by_ops"] = True
@@ -3014,7 +3053,7 @@ def ops_requeue_job(
     if not force:
         if status_now == JobStatus.FINISHED.value:
             raise HTTPException(409, "Finished jobs require force to requeue")
-        if status_now in (JobStatus.RUNNING.value, JobStatus.STOP_REQUESTED.value):
+        if status_now in (JobStatus.SETUP.value, JobStatus.RUNNING.value, JobStatus.STOP_REQUESTED.value):
             raise HTTPException(409, f"Job is {status_now}; stop it first or use force to requeue")
 
     prev_host = meta.get("target_host")
