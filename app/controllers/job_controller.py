@@ -51,6 +51,9 @@ def get_hosts():
 def get_deucalion_partition_limits():
     return job_service.get_deucalion_partition_limits()
 
+def get_deucalion_diagnostics():
+    return job_service.get_deucalion_diagnostics()
+
 def get_job_resolved_config(job_id: str):
     return job_service.get_job_resolved_config(job_id)
 

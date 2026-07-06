@@ -13,6 +13,9 @@ class StatusRequest(BaseModel):
     container_name: str | None = None
     exit_code: int | None = None
     error: str | None = None
+    error_code: str | None = None
+    error_category: str | None = None
+    error_hint: str | None = None
     details: dict | None = None
 
 

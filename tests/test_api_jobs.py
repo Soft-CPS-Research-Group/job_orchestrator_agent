@@ -344,6 +344,43 @@ def test_agent_job_status_updates_exit_code(api_client, monkeypatch):
     assert status_resp["exit_code"] == 0
 
 
+def test_agent_status_update_api_accepts_explicit_error_metadata(api_client, monkeypatch):
+    from app.config import settings
+    from app.services import job_service
+    from app.status import JobStatus
+
+    monkeypatch.setattr(settings, "AVAILABLE_HOSTS", ["worker-a"])
+
+    response = api_client.post(
+        "/run-simulation",
+        json={"config": {"experiment": {"name": "Status", "run_name": "Error"}}, "target_host": "worker-a"},
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    dispatched = job_service.agent_next_job("worker-a")
+    assert dispatched is not None
+
+    resp = api_client.post(
+        "/api/agent/job-status",
+        json={
+            "job_id": job_id,
+            "status": JobStatus.FAILED.value,
+            "worker_id": "worker-a",
+            "error": "worker reported failure",
+            "error_code": "explicit_worker_error",
+            "error_category": "worker",
+            "error_hint": "Use the worker-provided hint.",
+        },
+    )
+    assert resp.status_code == 200
+
+    status_resp = api_client.get(f"/status/{job_id}").json()
+    assert status_resp["error_code"] == "explicit_worker_error"
+    assert status_resp["error_category"] == "worker"
+    assert status_resp["error_hint"] == "Use the worker-provided hint."
+
+
 def test_stop_job_marks_stop_requested(api_client, monkeypatch):
     from app.config import settings
     from app.services import job_service
@@ -532,6 +569,41 @@ def test_deucalion_partitions_endpoint(api_client):
     assert partitions["normal-x86"]["time_limit_seconds"] == 48 * 60 * 60
     assert partitions["large-x86"]["time_limit_seconds"] == 72 * 60 * 60
     assert partitions["dev-a100-40"]["time_limit_seconds"] == 4 * 60 * 60
+
+
+def test_deucalion_diagnostics_endpoint(api_client, monkeypatch):
+    from app.config import settings
+    from app.services import job_service
+
+    monkeypatch.setattr(settings, "AVAILABLE_HOSTS", ["deucalion"])
+    monkeypatch.setattr(
+        job_service,
+        "_fetch_dockerhub_tags",
+        lambda repository, max_tags: (
+            [{"name": "sha-ready", "last_updated": "2026-07-05T22:00:00Z", "digest": "sha256:abc"}],
+            False,
+            1_783_300_000.0,
+        ),
+    )
+    job_service.record_host_heartbeat(
+        "deucalion",
+        {
+            "worker_version": "0.4.1",
+            "budget": {"accounts": [{"account": "f202508843cpcaa0g"}]},
+            "budget_refreshed_at": 1_783_299_900.0,
+        },
+    )
+
+    resp = api_client.get("/deucalion/diagnostics")
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert payload["ok"] is True
+    assert payload["checks"]["configured"]["ok"] is True
+    assert payload["checks"]["heartbeat"]["ok"] is True
+    assert payload["checks"]["sif_repository"]["ok"] is True
+    assert payload["checks"]["sif_repository"]["sample_tags"] == ["sha-ready"]
+    assert payload["checks"]["budget"]["ok"] is True
+    assert payload["host"]["info"]["worker_version"] == "0.4.1"
 
 
 def test_job_image_versions_endpoint(api_client, monkeypatch):

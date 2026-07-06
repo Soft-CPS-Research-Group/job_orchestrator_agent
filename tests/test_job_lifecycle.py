@@ -56,6 +56,7 @@ def jobs_env(tmp_path, monkeypatch):
 
     job_service.jobs.clear()
     job_service.host_heartbeats.clear()
+    monkeypatch.setattr(job_service, "_validate_deucalion_sif_tag_available", lambda _tag: None)
 
     try:
         yield SimpleNamespace(base=base, configs=configs, jobs=jobs_dir, queue=queue)
@@ -637,6 +638,440 @@ def test_queue_wait_ends_when_leaving_dispatched_if_running_missing():
     assert entry["job_meta"]["started_at"] is not None
 
 
+def test_get_progress_adds_eta_from_step_totals(monkeypatch):
+    job_id = "job-progress-eta"
+    now = 1_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.RUNNING.value,
+        "started_at": now - 100,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps({"job_id": job_id, "status": JobStatus.RUNNING.value}))
+    (progress_dir / "progress.json").write_text(
+        json.dumps({"step_current": 50, "step_total": 100, "timestamp": now - 5})
+    )
+
+    payload = job_service.get_progress(job_id)
+
+    assert payload["eta"]["available"] is True
+    assert payload["eta"]["progress_percent"] == 50.0
+    assert payload["eta"]["eta_seconds"] == pytest.approx(100.0)
+    assert payload["eta"]["estimated_finish_at"] == pytest.approx(now + 100)
+    assert payload["eta"]["elapsed_seconds"] == pytest.approx(100.0)
+    assert payload["eta"]["current"] == 50
+    assert payload["eta"]["total"] == 100
+    assert payload["eta_seconds"] == pytest.approx(100.0)
+
+
+def test_get_progress_adds_eta_from_config_total_when_progress_has_only_current(monkeypatch):
+    job_id = "job-progress-config-total"
+    now = 2_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.RUNNING.value,
+        "started_at": now - 100,
+        "config_path": "configs/demo.yaml",
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps({"job_id": job_id, "status": JobStatus.RUNNING.value}))
+    (Path(settings.CONFIGS_DIR) / "demo.yaml").write_text(
+        yaml.safe_dump({"simulator": {"episodes": 2, "episode_time_steps": 100}})
+    )
+    (progress_dir / "progress.json").write_text(json.dumps({"current": 50}))
+
+    payload = job_service.get_progress(job_id)
+
+    assert payload["eta"]["available"] is True
+    assert payload["eta"]["progress_percent"] == 25.0
+    assert payload["eta"]["total"] == 200
+    assert payload["eta"]["eta_seconds"] == pytest.approx(300.0)
+    assert payload["eta"]["confidence"] == "progress_rate_config_total"
+
+
+def test_get_progress_terminal_job_does_not_include_eta(monkeypatch):
+    job_id = "job-progress-finished"
+    now = 3_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.FINISHED.value,
+        "started_at": now - 120,
+        "finished_at": now - 20,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps({"job_id": job_id, "status": JobStatus.FINISHED.value}))
+    (progress_dir / "progress.json").write_text(json.dumps({"percent": 100}))
+
+    payload = job_service.get_progress(job_id)
+
+    assert payload["eta"]["available"] is False
+    assert payload["eta"]["reason"] == "job_not_running"
+    assert "eta_seconds" not in payload
+    assert "estimated_finish_at" not in payload
+
+
+def test_get_progress_does_not_use_dispatched_time_for_eta(monkeypatch):
+    job_id = "job-progress-no-started-at"
+    now = 4_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.RUNNING.value,
+        "dispatched_at": now - 500,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(
+        json.dumps({"job_id": job_id, "status": JobStatus.RUNNING.value, "status_updated_at": now - 10})
+    )
+    (progress_dir / "progress.json").write_text(json.dumps({"step_current": 50, "step_total": 100}))
+
+    payload = job_service.get_progress(job_id)
+
+    assert payload["eta"]["available"] is False
+    assert payload["eta"]["reason"] == "runtime_unavailable"
+    assert "eta_seconds" not in payload
+    assert "estimated_finish_at" not in payload
+
+
+def test_get_progress_ignores_slurm_elapsed_when_started_at_is_stale(monkeypatch):
+    job_id = "job-progress-ignore-slurm-elapsed"
+    now = 6_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.RUNNING.value,
+        "dispatched_at": now - 1_000,
+        "started_at": now - 5_000,
+        "details": {"slurm_state": "RUNNING", "slurm_elapsed": "00:15:00"},
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "status": JobStatus.RUNNING.value,
+                "details": {"slurm_state": "RUNNING", "slurm_elapsed": "00:15:00"},
+            }
+        )
+    )
+    (progress_dir / "progress.json").write_text(json.dumps({"step_current": 50, "step_total": 100}))
+
+    payload = job_service.get_progress(job_id)
+
+    assert payload["eta"]["available"] is False
+    assert payload["eta"]["reason"] == "runtime_unavailable"
+    assert "eta_seconds" not in payload
+    assert "estimated_finish_at" not in payload
+
+
+def test_active_running_lifecycle_repairs_current_attempt_from_notifications(monkeypatch):
+    job_id = "job-running-repair-current-attempt"
+    now = 8_000.0
+    current_started = now - 120
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    stale_meta = {
+        "job_id": job_id,
+        "job_name": "RepairCurrentAttempt",
+        "status": JobStatus.RUNNING.value,
+        "submitted_at": now - 2_000,
+        "queued_at": now - 2_000,
+        "dispatched_at": now - 130,
+        "started_at": now - 1_500,
+        "finished_at": now - 1_000,
+        "email_notifications": [
+            {"status": JobStatus.RUNNING.value, "attempted_at": now - 1_500},
+            {"status": JobStatus.RUNNING.value, "attempted_at": current_started},
+        ],
+        "last_email_notification": {"status": JobStatus.RUNNING.value, "attempted_at": current_started},
+    }
+    job_service.jobs[job_id] = dict(stale_meta)
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job_info.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "finished_at": now - 1_000,
+                "run_duration_seconds": 500,
+            }
+        )
+    )
+    job_utils.write_status_file(
+        job_id,
+        JobStatus.RUNNING.value,
+        {
+            "email_notifications": stale_meta["email_notifications"],
+            "last_email_notification": stale_meta["last_email_notification"],
+        },
+    )
+    (progress_dir / "progress.json").write_text(json.dumps({"step_current": 50, "step_total": 100}))
+
+    info = job_service.get_job_info(job_id)
+    [listed] = [item for item in job_service.list_jobs() if item["job_id"] == job_id]
+    progress = job_service.get_progress(job_id)
+
+    assert info["started_at"] == pytest.approx(current_started)
+    assert "finished_at" not in info
+    assert info["run_duration_seconds"] == pytest.approx(120)
+    assert listed["started_at"] == pytest.approx(current_started)
+    assert listed["finished_at"] is None
+    assert listed["run_duration_seconds"] == pytest.approx(120)
+    assert progress["eta"]["available"] is True
+    assert progress["eta"]["eta_seconds"] == pytest.approx(120)
+
+
+def test_queued_start_estimate_waits_for_active_job_eta(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a"]
+    now = 12_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.record_host_heartbeat("worker-a", {"max_active_jobs": 1})
+
+    active_id = "job-active-for-queued-start"
+    job_service.jobs[active_id] = {
+        "job_id": active_id,
+        "status": JobStatus.RUNNING.value,
+        "target_host": "worker-a",
+        "started_at": now - 100,
+        "last_status_at": now,
+    }
+    job_utils.save_job(active_id, job_service.jobs[active_id])
+    active_dir = Path(settings.JOBS_DIR) / active_id
+    active_progress_dir = active_dir / "progress"
+    active_progress_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(active_id, JobStatus.RUNNING.value, {})
+    (active_progress_dir / "progress.json").write_text(json.dumps({"step_current": 50, "step_total": 100}))
+
+    queued_id = "job-queued-start-estimate"
+    job_service.jobs[queued_id] = {
+        "job_id": queued_id,
+        "status": JobStatus.QUEUED.value,
+        "target_host": "worker-a",
+        "preferred_host": "worker-a",
+        "require_host": True,
+        "queued_at": now - 10,
+        "last_status_at": now,
+    }
+    job_utils.save_job(queued_id, job_service.jobs[queued_id])
+    job_utils.write_status_file(queued_id, JobStatus.QUEUED.value, {})
+    job_utils.enqueue_job(
+        {
+            "job_id": queued_id,
+            "preferred_host": "worker-a",
+            "require_host": True,
+            "enqueued_at": now - 10,
+        }
+    )
+
+    [listed] = [item for item in job_service.list_jobs() if item["job_id"] == queued_id]
+    [queued] = [item for item in job_service.list_queue() if item["job_id"] == queued_id]
+
+    for payload in (listed, queued):
+        estimate = payload["queued_start_estimate"]
+        assert estimate["available"] is True
+        assert estimate["reason"] == "waiting_for_active_job"
+        assert estimate["target_host"] == "worker-a"
+        assert estimate["blocking_job_id"] == active_id
+        assert estimate["estimated_start_at"] == pytest.approx(now + 100)
+        assert estimate["estimated_start_seconds"] == pytest.approx(100)
+        assert payload["estimated_start_at"] == pytest.approx(now + 100)
+
+
+def test_queued_start_estimate_only_first_queued_job_per_host(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a"]
+    now = 13_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.record_host_heartbeat("worker-a", {"max_active_jobs": 1})
+
+    entries = []
+    for index in range(2):
+        job_id = f"job-queued-order-{index}"
+        job_service.jobs[job_id] = {
+            "job_id": job_id,
+            "status": JobStatus.QUEUED.value,
+            "target_host": "worker-a",
+            "preferred_host": "worker-a",
+            "require_host": True,
+            "queued_at": now + index,
+            "last_status_at": now,
+        }
+        job_utils.save_job(job_id, job_service.jobs[job_id])
+        job_utils.write_status_file(job_id, JobStatus.QUEUED.value, {})
+        entries.append(
+            {
+                "job_id": job_id,
+                "preferred_host": "worker-a",
+                "require_host": True,
+                "enqueued_at": now + index,
+            }
+        )
+
+    estimates = job_service._queued_start_estimates(entries, now_ts=now)
+
+    assert estimates["job-queued-order-0"]["available"] is True
+    assert estimates["job-queued-order-0"]["reason"] == "slot_available"
+    assert estimates["job-queued-order-0"]["estimated_start_at"] == pytest.approx(now)
+    assert estimates["job-queued-order-1"]["available"] is False
+    assert estimates["job-queued-order-1"]["reason"] == "queued_behind_job"
+    assert estimates["job-queued-order-1"]["queue_position"] == 2
+
+
+def test_agent_update_status_classifies_deucalion_config_error_from_log():
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+    job_id = "job-deucalion-config-error"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "job_name": "ConfigError",
+        "config_path": "configs/demo.yaml",
+        "target_host": "deucalion",
+        "status": JobStatus.DISPATCHED.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    logs_dir = job_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job_info.json").write_text(json.dumps({"job_id": job_id}))
+    (logs_dir / f"{job_id}.log").write_text(
+        "Traceback (most recent call last):\n"
+        "ValueError: Configuration uses the deprecated top-level 'algorithm' key. "
+        "Migrate to a 'pipeline' list.\n"
+    )
+    job_utils.write_status_file(job_id, JobStatus.DISPATCHED.value, {})
+
+    job_service.agent_update_status(
+        job_id,
+        JobStatus.FAILED.value,
+        {
+            "worker_id": "deucalion",
+            "error": "slurm_failed",
+            "details": {"slurm_state": "FAILED"},
+        },
+    )
+
+    status_payload = job_service.get_status(job_id)
+    assert status_payload["error"] == "slurm_failed"
+    assert status_payload["error_code"] == "config_deprecated_algorithm"
+    assert status_payload["error_category"] == "configuration"
+    assert status_payload["details"]["error_code"] == "config_deprecated_algorithm"
+
+    info = job_service.get_job_info(job_id)
+    assert info["error_code"] == "config_deprecated_algorithm"
+    tracked = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
+    assert tracked[job_id]["error_code"] == "config_deprecated_algorithm"
+
+
+def test_agent_update_status_does_not_treat_normal_preflight_log_as_preflight_failure():
+    job_id = "job-deucalion-slurm-failed"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "deucalion",
+        "status": JobStatus.DISPATCHED.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    logs_dir = job_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job_info.json").write_text(json.dumps({"job_id": job_id}))
+    (logs_dir / f"{job_id}.log").write_text(
+        "Preflight stage preflight:sif (ensure SIF image)\n"
+        "Submitted Slurm job: 123\n"
+        "Terminal Slurm state=FAILED; reporting job status='failed'\n"
+    )
+    job_utils.write_status_file(job_id, JobStatus.DISPATCHED.value, {})
+
+    job_service.agent_update_status(
+        job_id,
+        JobStatus.FAILED.value,
+        {
+            "worker_id": "deucalion",
+            "error": "slurm_failed",
+            "details": {"slurm_state": "FAILED", "executor_stage": "execution:poll"},
+        },
+    )
+
+    status_payload = job_service.get_status(job_id)
+    assert status_payload["error_code"] == "slurm_failed"
+    assert status_payload["error_category"] == "slurm"
+
+
+def test_agent_update_status_classifies_deucalion_connectivity_timeout():
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+    job_id = "job-deucalion-connectivity-timeout"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "deucalion",
+        "status": JobStatus.RUNNING.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job_info.json").write_text(json.dumps({"job_id": job_id}))
+    job_utils.write_status_file(job_id, JobStatus.RUNNING.value, {})
+
+    job_service.agent_update_status(
+        job_id,
+        JobStatus.FAILED.value,
+        {
+            "worker_id": "deucalion",
+            "error": "deucalion_unreachable_timeout",
+            "details": {
+                "connectivity": "down",
+                "error": "SSH command timed out after 30s: squeue -h -j 123",
+            },
+        },
+    )
+
+    status_payload = job_service.get_status(job_id)
+    assert status_payload["error_code"] == "deucalion_connectivity_timeout"
+    assert status_payload["error_category"] == "deucalion_connectivity"
+    info = job_service.get_job_info(job_id)
+    assert info["details"]["error_code"] == "deucalion_connectivity_timeout"
+
+
+def test_get_job_info_classifies_existing_deucalion_error_from_log():
+    job_id = "job-deucalion-existing-error"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "deucalion",
+        "status": JobStatus.FAILED.value,
+        "error": "slurm_failed",
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    logs_dir = job_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job_info.json").write_text(json.dumps({"job_id": job_id, "error": "slurm_failed"}))
+    (logs_dir / f"{job_id}.log").write_text(
+        "ValueError: Configuration uses the deprecated top-level 'algorithm' key. "
+        "Migrate to a 'pipeline' list.\n"
+    )
+    job_utils.write_status_file(job_id, JobStatus.FAILED.value, {"error": "slurm_failed"})
+
+    info = job_service.get_job_info(job_id)
+
+    assert info["error_code"] == "config_deprecated_algorithm"
+    assert info["error_category"] == "configuration"
+
+
 def test_launch_defaults_to_first_host():
     settings.AVAILABLE_HOSTS = ["remoteA", "remoteB"]
 
@@ -795,6 +1230,109 @@ def test_launch_deucalion_options_are_dispatched_to_deucalion_worker():
     assert dispatched["deucalion_options"]["partition"] == "normal-x86"
     assert dispatched["deucalion_options"]["cpus_per_task"] == 8
     assert dispatched["deucalion_options"]["datasets"] == ["datasets/demo.csv"]
+
+
+def test_launch_deucalion_gpu_partition_defaults_to_one_gpu():
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Deucalion", "run_name": "GpuDefaults"}},
+                target_host="deucalion",
+                image_tag="sha-gpudefault",
+                deucalion_options={"partition": "normal-a100-80"},
+            )
+        )
+    )
+
+    dispatched = job_service.agent_next_job("deucalion")
+    assert dispatched is not None
+    assert dispatched["job_id"] == result["job_id"]
+    assert dispatched["deucalion_options"]["partition"] == "normal-a100-80"
+    assert dispatched["deucalion_options"]["gpus"] == 1
+
+
+def test_launch_deucalion_rejects_invalid_gpu_partition_options():
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={"experiment": {"name": "Deucalion", "run_name": "NoGpu"}},
+                    target_host="deucalion",
+                    image_tag="sha-nogpu",
+                    deucalion_options={"partition": "normal-a100-80", "gpus": 0},
+                )
+            )
+        )
+    assert exc.value.status_code == 400
+    assert "gpus must be > 0" in str(exc.value.detail)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={"experiment": {"name": "Deucalion", "run_name": "GpuOnCpu"}},
+                    target_host="deucalion",
+                    image_tag="sha-cpugpu",
+                    deucalion_options={"partition": "normal-x86", "gpus": 1},
+                )
+            )
+        )
+    assert exc.value.status_code == 400
+    assert "requires a GPU partition" in str(exc.value.detail)
+
+
+def test_launch_deucalion_rejects_image_tag_without_sif(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["deucalion"]
+
+    def _missing_sif(tag: str) -> None:
+        raise HTTPException(
+            400,
+            f"Image tag '{tag}' is not Deucalion-ready: SIF artifact was not found",
+        )
+
+    monkeypatch.setattr(job_service, "_validate_deucalion_sif_tag_available", _missing_sif)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={"experiment": {"name": "Deucalion", "run_name": "MissingSif"}},
+                    target_host="deucalion",
+                    image_tag="sha-missing",
+                )
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "not Deucalion-ready" in str(exc.value.detail)
+    assert job_service.jobs == {}
+    assert not list(Path(settings.QUEUE_DIR).glob("*.json"))
+
+
+def test_launch_non_deucalion_does_not_validate_sif(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a", "deucalion"]
+    called = []
+
+    def _record_validation(tag: str) -> None:
+        called.append(tag)
+
+    monkeypatch.setattr(job_service, "_validate_deucalion_sif_tag_available", _record_validation)
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Server", "run_name": "NoSifCheck"}},
+                target_host="worker-a",
+                image_tag="sha-worker",
+            )
+        )
+    )
+
+    assert result["host"] == "worker-a"
+    assert called == []
 
 
 def test_deucalion_dispatch_uses_local_mlflow_tracking_uri():
@@ -1111,6 +1649,61 @@ def test_agent_update_status_idempotent():
     assert status_data["status"] == JobStatus.RUNNING.value
 
 
+def test_agent_running_update_replaces_started_at_from_previous_attempt(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a"]
+    now = 10_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_id = "job-running-repairs-start"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "status": JobStatus.DISPATCHED.value,
+        "dispatched_at": now - 100,
+        "started_at": now - 5_000,
+        "finished_at": now - 4_000,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(job_id, JobStatus.DISPATCHED.value, {})
+
+    resp = job_service.agent_update_status(job_id, JobStatus.RUNNING.value, {"worker_id": "worker-a"})
+
+    assert resp["ok"] is True
+    assert job_service.jobs[job_id]["started_at"] == pytest.approx(now)
+    assert "finished_at" not in job_service.jobs[job_id]
+
+
+def test_repeated_running_update_clears_stale_lifecycle_from_previous_attempt(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["worker-a"]
+    now = 10_500.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_id = "job-running-clears-stale-start"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "status": JobStatus.RUNNING.value,
+        "dispatched_at": now - 100,
+        "started_at": now - 5_000,
+        "finished_at": now - 4_000,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(job_id, JobStatus.RUNNING.value, {})
+    (progress_dir / "progress.json").write_text(json.dumps({"step_current": 50, "step_total": 100}))
+
+    resp = job_service.agent_update_status(job_id, JobStatus.RUNNING.value, {"worker_id": "worker-a"})
+
+    assert resp["ok"] is True
+    assert "started_at" not in job_service.jobs[job_id]
+    assert "finished_at" not in job_service.jobs[job_id]
+    payload = job_service.get_progress(job_id)
+    assert payload["eta"]["available"] is False
+    assert payload["eta"]["reason"] == "runtime_unavailable"
+
+
 def test_mark_stale_dispatched_requeues(monkeypatch):
     settings.AVAILABLE_HOSTS = ["worker-a"]
     monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
@@ -1258,16 +1851,36 @@ def test_ops_requeue_dispatched():
         "preferred_host": "worker-a",
         "require_host": True,
         "status": JobStatus.DISPATCHED.value,
+        "error": "old failure",
+        "error_code": "old_error",
+        "error_category": "worker",
+        "error_hint": "old hint",
     }
     job_utils.save_job(job_id, job_service.jobs[job_id])
     job_dir = Path(settings.JOBS_DIR) / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job_info.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "error": "old failure",
+                "error_code": "old_error",
+                "error_category": "worker",
+                "error_hint": "old hint",
+            }
+        )
+    )
     job_utils.write_status_file(job_id, JobStatus.DISPATCHED.value, {})
 
     resp = job_service.ops_requeue_job(job_id)
     assert resp["status"] == JobStatus.QUEUED.value
     status_data = json.loads((job_dir / "status.json").read_text())
     assert status_data["status"] == JobStatus.QUEUED.value
+    tracked = json.loads(Path(settings.JOB_TRACK_FILE).read_text())[job_id]
+    info = json.loads((job_dir / "job_info.json").read_text())
+    for key in ("error", "error_code", "error_category", "error_hint"):
+        assert key not in tracked
+        assert key not in info
     queue_file = Path(settings.QUEUE_DIR) / f"{job_id}.json"
     assert queue_file.exists()
 
@@ -1340,8 +1953,10 @@ def test_ops_fail_and_cancel():
     assert not queue_file.exists()
 
 
-def test_ops_requeue_failed_job_without_force():
+def test_ops_requeue_failed_job_without_force(monkeypatch):
     settings.AVAILABLE_HOSTS = ["worker-a"]
+    now = 20_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
     job_id = "job-ops-requeue-failed"
     job_service.jobs[job_id] = {
         "job_id": job_id,
@@ -1351,6 +1966,11 @@ def test_ops_requeue_failed_job_without_force():
         "error": "boom",
         "exit_code": 2,
         "container_id": "cid-old",
+        "queued_at": now - 5_000,
+        "dispatched_at": now - 4_000,
+        "started_at": now - 3_900,
+        "finished_at": now - 100,
+        "requeue_count": 1,
     }
     job_utils.save_job(job_id, job_service.jobs[job_id])
     job_dir = Path(settings.JOBS_DIR) / job_id
@@ -1365,6 +1985,8 @@ def test_ops_requeue_failed_job_without_force():
                 "target_host": "worker-a",
                 "container_id": "cid-old",
                 "error": "boom",
+                "started_at": now - 3_900,
+                "finished_at": now - 100,
             }
         )
     )
@@ -1379,9 +2001,16 @@ def test_ops_requeue_failed_job_without_force():
     refreshed = json.loads(Path(settings.JOB_TRACK_FILE).read_text())[job_id]
     assert "error" not in refreshed
     assert "container_id" not in refreshed
+    assert refreshed["queued_at"] == pytest.approx(now)
+    assert "dispatched_at" not in refreshed
+    assert "started_at" not in refreshed
+    assert "finished_at" not in refreshed
+    assert refreshed["requeue_count"] == 2
 
     info = json.loads((job_dir / "job_info.json").read_text())
     assert "error" not in info
+    assert "started_at" not in info
+    assert "finished_at" not in info
     assert "container_id" not in info
 
 

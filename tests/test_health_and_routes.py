@@ -40,6 +40,7 @@ def test_job_orchestrator_exposes_expected_routes():
         "/job-resolved-config/{job_id}",
         "/hosts",
         "/deucalion/partitions",
+        "/deucalion/diagnostics",
         "/job-images/versions",
         "/api/agent/next-job",
         "/api/agent/job-status",

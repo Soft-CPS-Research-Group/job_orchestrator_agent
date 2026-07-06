@@ -74,6 +74,11 @@ def deucalion_partitions():
     return job_controller.get_deucalion_partition_limits()
 
 
+@router.get("/deucalion/diagnostics")
+def deucalion_diagnostics():
+    return job_controller.get_deucalion_diagnostics()
+
+
 @router.get("/job-images/versions")
 async def job_image_versions(
     repository: str | None = Query(default=None),

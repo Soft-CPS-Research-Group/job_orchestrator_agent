@@ -64,6 +64,19 @@ RUNTIME_RESET_FIELDS = {
     "last_host",
 }
 
+ATTEMPT_LIFECYCLE_RESET_FIELDS = {
+    "queued_at",
+    "dispatched_at",
+    "started_at",
+    "stop_requested_at",
+    "finished_at",
+    "last_status_at",
+    "status_updated_at",
+    "queue_wait_seconds",
+    "run_duration_seconds",
+    "total_duration_seconds",
+}
+
 JOB_INFO_RUNTIME_RESET_FIELDS = {
     "container_id",
     "container_name",
@@ -71,6 +84,7 @@ JOB_INFO_RUNTIME_RESET_FIELDS = {
     "error",
     "details",
     "target_host",
+    *ATTEMPT_LIFECYCLE_RESET_FIELDS,
 }
 
 DEUCALION_SLURM_ACTIVE_STATES = {
@@ -105,6 +119,88 @@ _LOG_CHUNK_DEFAULT_TAIL_LINES = 200
 _LOG_CHUNK_DEFAULT_MAX_BYTES = 256 * 1024
 _LOG_CHUNK_MAX_BYTES_LIMIT = 2 * 1024 * 1024
 CONTAINER_DATA_ROOT = "/data"
+
+ERROR_METADATA_KEYS = ("error_code", "error_category", "error_hint")
+
+ERROR_CLASSIFICATION_RULES = (
+    {
+        "code": "config_deprecated_algorithm",
+        "category": "configuration",
+        "hint": "Migrate the config from the deprecated top-level 'algorithm' key to a pipeline list.",
+        "patterns": (
+            "deprecated top-level 'algorithm' key",
+            "migrate to a 'pipeline' list",
+        ),
+    },
+    {
+        "code": "deucalion_missing_job_image",
+        "category": "worker_payload",
+        "hint": "The Deucalion worker did not receive a tagged image for this job.",
+        "patterns": ("missing job image in payload for deucalion executor",),
+    },
+    {
+        "code": "deucalion_command_mode_invalid",
+        "category": "configuration",
+        "hint": "execution.deucalion.command_mode=exec requires an explicit executable command.",
+        "patterns": ("command_mode=exec requires an explicit executable",),
+    },
+    {
+        "code": "deucalion_preflight_failed",
+        "category": "deucalion_preflight",
+        "hint": "The job failed before Slurm submission while preparing remote paths, image, or datasets.",
+        "patterns": (
+            "submission/preflight failure",
+            "preflight failure",
+        ),
+    },
+    {
+        "code": "deucalion_connectivity_timeout",
+        "category": "deucalion_connectivity",
+        "hint": "The worker lost reliable SSH/Slurm connectivity long enough to fail the job.",
+        "patterns": (
+            "deucalion_unreachable_timeout",
+            "ssh command timed out",
+            "connection timed out",
+            "connectivity timeout reached",
+        ),
+    },
+    {
+        "code": "slurm_unknown_timeout",
+        "category": "slurm",
+        "hint": "Slurm kept returning an unknown state beyond the configured grace period.",
+        "patterns": ("slurm_unknown_timeout",),
+    },
+    {
+        "code": "artifact_sync_failed",
+        "category": "artifact_sync",
+        "hint": "The Slurm job completed, but result/log artifact synchronization failed.",
+        "patterns": ("artifact_sync_failed",),
+    },
+    {
+        "code": "slurm_out_of_memory",
+        "category": "slurm",
+        "hint": "Slurm reported an out-of-memory failure. Increase memory or reduce workload size.",
+        "patterns": ("slurm_out_of_memory", "out_of_memory", "out of memory"),
+    },
+    {
+        "code": "slurm_timeout",
+        "category": "slurm",
+        "hint": "Slurm terminated the job after it reached its walltime limit.",
+        "patterns": ("slurm_timeout", "timed out", "time limit"),
+    },
+    {
+        "code": "slurm_cancelled",
+        "category": "slurm",
+        "hint": "The Slurm job was cancelled before completion.",
+        "patterns": ("slurm_cancelled", "cancelled", "canceled"),
+    },
+    {
+        "code": "slurm_failed",
+        "category": "slurm",
+        "hint": "Slurm reported a failed terminal state. Check the job log for the application error.",
+        "patterns": ("slurm_failed", "slurm_fail"),
+    },
+)
 
 
 def _parse_timestamp(value) -> float | None:
@@ -267,6 +363,105 @@ def _resolve_log_path(job_id: str) -> Optional[str]:
     newest = max(log_candidates, key=lambda entry: entry.stat().st_mtime)
     return str(newest)
 
+
+def _read_text_tail(path: str, max_bytes: int = 64 * 1024) -> str:
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as handle:
+            if size > max_bytes:
+                handle.seek(size - max_bytes)
+            return handle.read(max_bytes).decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _error_classification_text(job_id: str, error: Any, details: dict | None) -> str:
+    parts: list[str] = []
+    if error is not None:
+        parts.append(str(error))
+    if isinstance(details, dict):
+        for key in (
+            "error",
+            "message",
+            "stderr",
+            "stdout",
+            "executor_stage",
+            "slurm_state",
+            "slurm_reason",
+            "connectivity",
+        ):
+            value = details.get(key)
+            if value is not None:
+                parts.append(str(value))
+    log_path = _resolve_log_path(job_id)
+    if log_path:
+        tail = _read_text_tail(log_path)
+        if tail:
+            parts.append(tail)
+    return "\n".join(parts).lower()
+
+
+def _classify_job_error(job_id: str, status: str | None, extra: dict | None) -> dict[str, str] | None:
+    payload = extra if isinstance(extra, dict) else {}
+    explicit_code = payload.get("error_code")
+    if isinstance(explicit_code, str) and explicit_code.strip():
+        return {
+            "code": explicit_code.strip(),
+            "category": str(payload.get("error_category") or "unknown"),
+            "hint": str(payload.get("error_hint") or ""),
+        }
+
+    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+    has_error_signal = (
+        payload.get("error") is not None
+        or details.get("error") is not None
+        or status == JobStatus.FAILED.value
+    )
+    if not has_error_signal:
+        return None
+
+    stage = details.get("executor_stage")
+    if isinstance(stage, str) and stage.startswith("preflight:"):
+        for rule in ERROR_CLASSIFICATION_RULES:
+            if rule["code"] == "deucalion_preflight_failed":
+                return {
+                    "code": str(rule["code"]),
+                    "category": str(rule["category"]),
+                    "hint": str(rule["hint"]),
+                }
+
+    text = _error_classification_text(job_id, payload.get("error"), details)
+    if not text:
+        return None
+
+    for rule in ERROR_CLASSIFICATION_RULES:
+        if any(pattern in text for pattern in rule["patterns"]):
+            return {
+                "code": str(rule["code"]),
+                "category": str(rule["category"]),
+                "hint": str(rule["hint"]),
+            }
+    return None
+
+
+def _enrich_error_metadata(job_id: str, status: str | None, extra: dict) -> None:
+    classification = _classify_job_error(job_id, status, extra)
+    if not classification:
+        return
+
+    extra.setdefault("error_code", classification["code"])
+    extra.setdefault("error_category", classification["category"])
+    if classification.get("hint"):
+        extra.setdefault("error_hint", classification["hint"])
+
+    details = extra.get("details")
+    if isinstance(details, dict):
+        details.setdefault("error_code", extra["error_code"])
+        details.setdefault("error_category", extra["error_category"])
+        if extra.get("error_hint"):
+            details.setdefault("error_hint", extra["error_hint"])
+
+
 def _container_name(job_id: str, job_name: str) -> str:
     safe_name = _slug(job_name)[:40]
     return f"{settings.CONTAINER_NAME_PREFIX}_{safe_name}_{job_id[:8]}"
@@ -327,7 +522,15 @@ def _apply_lifecycle_metadata(meta: dict, *, prev_status: str | None, status: st
         meta["dispatched_at"] = status_ts
     elif status == JobStatus.RUNNING.value:
         meta.setdefault("queued_at", status_ts)
-        meta.setdefault("started_at", status_ts)
+        meta.pop("finished_at", None)
+        current_started = _ensure_float(meta.get("started_at"))
+        current_dispatched = _ensure_float(meta.get("dispatched_at"))
+        has_stale_start = current_dispatched is not None and current_started is not None and current_started < current_dispatched
+        if current_started is None or has_stale_start:
+            if prev_status == JobStatus.RUNNING.value:
+                meta.pop("started_at", None)
+            else:
+                meta["started_at"] = status_ts
     elif status == JobStatus.STOP_REQUESTED.value:
         meta["stop_requested_at"] = status_ts
 
@@ -354,8 +557,14 @@ def _apply_detail_timestamps(meta: dict, details: dict, *, status_ts: float) -> 
         meta["queued_at"] = min(current_queued, queued_ts) if current_queued is not None else queued_ts
 
     current_started = _ensure_float(meta.get("started_at"))
+    current_dispatched = _ensure_float(meta.get("dispatched_at"))
+    if started_ts is not None and current_dispatched is not None and started_ts < current_dispatched:
+        started_ts = None
     if started_ts is not None:
-        meta["started_at"] = min(current_started, started_ts) if current_started is not None else started_ts
+        if current_started is None or (current_dispatched is not None and current_started < current_dispatched):
+            meta["started_at"] = started_ts
+        else:
+            meta["started_at"] = min(current_started, started_ts)
 
     # Queue timing is backend lifecycle timing: queue ends when leaving dispatched/running path.
     if meta.get("status") in TERMINAL_JOB_STATUSES and _ensure_float(meta.get("started_at")) is None:
@@ -367,24 +576,99 @@ def _apply_detail_timestamps(meta: dict, details: dict, *, status_ts: float) -> 
             meta["queued_at"] = fallback_queued
 
 
+def _email_notification_records(meta: dict) -> list[dict]:
+    records: list[dict] = []
+    history = meta.get("email_notifications")
+    if isinstance(history, list):
+        records.extend(item for item in history if isinstance(item, dict))
+    last = meta.get("last_email_notification")
+    if isinstance(last, dict):
+        records.append(last)
+    return records
+
+
+def _current_attempt_running_at(meta: dict) -> float | None:
+    dispatched_at = _ensure_float(meta.get("dispatched_at"))
+    candidates = []
+    for record in _email_notification_records(meta):
+        if record.get("status") != JobStatus.RUNNING.value:
+            continue
+        attempted_at = _parse_timestamp(record.get("attempted_at"))
+        if attempted_at is None:
+            continue
+        if dispatched_at is not None and attempted_at < dispatched_at:
+            continue
+        candidates.append(attempted_at)
+    return min(candidates) if candidates else None
+
+
+def _repair_active_lifecycle_metadata(meta: dict) -> bool:
+    status = str(meta.get("status") or "")
+    changed = False
+    if status not in TERMINAL_JOB_STATUSES and "finished_at" in meta:
+        meta.pop("finished_at", None)
+        changed = True
+
+    current_started = _ensure_float(meta.get("started_at"))
+    current_dispatched = _ensure_float(meta.get("dispatched_at"))
+    has_stale_start = (
+        current_started is not None
+        and current_dispatched is not None
+        and current_started < current_dispatched
+    )
+
+    if status == JobStatus.RUNNING.value and (current_started is None or has_stale_start):
+        repaired_started = _current_attempt_running_at(meta)
+        if repaired_started is not None:
+            if current_started != repaired_started:
+                meta["started_at"] = repaired_started
+                changed = True
+        elif has_stale_start:
+            meta.pop("started_at", None)
+            changed = True
+    elif status in {JobStatus.QUEUED.value, JobStatus.DISPATCHED.value} and has_stale_start:
+        meta.pop("started_at", None)
+        changed = True
+
+    return changed
+
+
+def _normalized_job_meta(job_id: str, meta: dict, *, persist: bool = False) -> dict:
+    normalized = dict(meta)
+    if not normalized:
+        return normalized
+    if _repair_active_lifecycle_metadata(normalized) and persist:
+        _persist_job(job_id, normalized)
+    return normalized
+
+
 def _compute_job_durations(meta: dict, now_ts: float | None = None) -> dict:
     now = now_ts or time.time()
     submitted_at = _ensure_float(meta.get("submitted_at"))
     queued_at = _ensure_float(meta.get("queued_at"))
     started_at = _ensure_float(meta.get("started_at"))
+    dispatched_at = _ensure_float(meta.get("dispatched_at"))
     finished_at = _ensure_float(meta.get("finished_at"))
+    status = str(meta.get("status") or "")
+
+    if status not in TERMINAL_JOB_STATUSES:
+        finished_at = None
+    if started_at is not None and dispatched_at is not None and started_at < dispatched_at:
+        started_at = None
+    if started_at is not None and finished_at is None and started_at >= now:
+        started_at = None
 
     queue_wait_seconds = None
-    if queued_at and started_at:
+    if queued_at is not None and started_at is not None:
         queue_wait_seconds = max(0.0, started_at - queued_at)
 
     run_duration_seconds = None
-    if started_at:
+    if started_at is not None:
         run_end = finished_at or now
         run_duration_seconds = max(0.0, run_end - started_at)
 
     total_duration_seconds = None
-    if submitted_at:
+    if submitted_at is not None:
         total_end = finished_at or now
         total_duration_seconds = max(0.0, total_end - submitted_at)
 
@@ -393,6 +677,527 @@ def _compute_job_durations(meta: dict, now_ts: float | None = None) -> dict:
         "run_duration_seconds": run_duration_seconds,
         "total_duration_seconds": total_duration_seconds,
     }
+
+
+def _number_value(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed == parsed and parsed not in (float("inf"), float("-inf")) else None
+
+
+def _progress_number(payload: dict, *keys: str) -> float | None:
+    for key in keys:
+        value = _number_value(payload.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _progress_timestamp(payload: dict) -> float | None:
+    for key in ("updated_at", "timestamp", "last_update", "last_updated_at", "time"):
+        parsed = _parse_timestamp(payload.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _load_eta_config(job_id: str, meta: dict) -> dict:
+    candidate_paths = [_resolved_config_path(job_id)]
+    config_path = meta.get("config_path")
+    if isinstance(config_path, str) and config_path.strip():
+        raw_config_path = config_path.strip()
+        if os.path.isabs(raw_config_path):
+            candidate_paths.append(raw_config_path)
+        relative_path = os.path.normpath(raw_config_path.lstrip("/"))
+        if relative_path and relative_path != "." and not relative_path.startswith(".."):
+            if relative_path == "configs":
+                candidate_paths.append(settings.CONFIGS_DIR)
+            elif relative_path.startswith("configs/"):
+                candidate_paths.append(os.path.join(settings.CONFIGS_DIR, relative_path[len("configs/") :]))
+            else:
+                candidate_paths.append(os.path.join(settings.CONFIGS_DIR, relative_path))
+            candidate_paths.append(os.path.join(settings.VM_SHARED_DATA, relative_path))
+
+    seen_paths: set[str] = set()
+    for path in candidate_paths:
+        if path in seen_paths:
+            continue
+        seen_paths.add(path)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                payload = yaml.safe_load(handle) or {}
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            _LOGGER.debug("Unable to read config for ETA calculation: %s", path, exc_info=True)
+    return {}
+
+
+def _nested_mapping(payload: dict, key: str) -> dict:
+    value = payload.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _eta_total_work_from_config(config: dict) -> tuple[float | None, str | None]:
+    simulator = _nested_mapping(config, "simulator")
+    candidates = [simulator, config]
+
+    episodes = next(
+        (
+            value
+            for section in candidates
+            for value in (_progress_number(section, "episodes", "episode_total", "num_episodes"),)
+            if value is not None and value > 0
+        ),
+        None,
+    )
+
+    per_episode_steps = next(
+        (
+            value
+            for section in candidates
+            for value in (
+                _progress_number(
+                    section,
+                    "episode_time_steps",
+                    "time_steps",
+                    "timesteps",
+                    "steps",
+                    "max_steps",
+                    "step_total",
+                ),
+            )
+            if value is not None and value > 0
+        ),
+        None,
+    )
+
+    if per_episode_steps is None:
+        start = next(
+            (
+                value
+                for section in candidates
+                for value in (_progress_number(section, "simulation_start_time_step", "start_time_step"),)
+                if value is not None
+            ),
+            None,
+        )
+        end = next(
+            (
+                value
+                for section in candidates
+                for value in (_progress_number(section, "simulation_end_time_step", "end_time_step"),)
+                if value is not None
+            ),
+            None,
+        )
+        if start is not None and end is not None and end >= start:
+            per_episode_steps = end - start + 1
+
+    if episodes is not None and per_episode_steps is not None:
+        return episodes * per_episode_steps, "config_simulator"
+    if per_episode_steps is not None:
+        return per_episode_steps, "config_steps"
+    return None, None
+
+
+def _progress_fraction(payload: dict, config_total_work: float | None = None) -> dict:
+    percent_keys = ("progress_pct", "percent", "progress_percent", "completion")
+    percent_value = _progress_number(payload, *percent_keys)
+    if percent_value is None and isinstance(payload.get("progress"), dict):
+        percent_value = _progress_number(payload["progress"], "percent", "value", "progress")
+    elif percent_value is None:
+        raw_progress = payload.get("progress")
+        if not isinstance(raw_progress, str):
+            percent_value = _number_value(raw_progress)
+
+    current = None
+    total = None
+    source = None
+    unit = "work"
+
+    for current_key, total_key, candidate_unit in (
+        ("global_step_current", "global_step_total", "step"),
+        ("global_step", "global_step_total", "step"),
+        ("step_current", "step_total", "step"),
+        ("step", "step_total", "step"),
+        ("timestep_current", "timestep_total", "timestep"),
+        ("time_step_current", "time_step_total", "timestep"),
+        ("episode_current", "episode_total", "episode"),
+        ("episode", "episode_total", "episode"),
+    ):
+        current_value = _progress_number(payload, current_key)
+        total_value = _progress_number(payload, total_key)
+        if current_value is None or total_value is None or total_value <= 0:
+            continue
+        current = current_value
+        total = total_value
+        source = f"{current_key}/{total_key}"
+        unit = candidate_unit
+        break
+
+    if current is None:
+        step_current = _progress_number(payload, "step_current", "step", "timestep_current", "time_step_current")
+        episode_current = _progress_number(payload, "episode_current", "episode")
+        episode_total = _progress_number(payload, "episode_total", "episodes")
+        step_total = _progress_number(payload, "step_total", "episode_time_steps")
+        if step_current is not None and step_total is not None and step_total > 0 and episode_total:
+            episode_index = 0.0
+            if episode_current is not None:
+                # Prefer one-based episode_current when available; fall back to zero-based episode.
+                episode_index = max(0.0, episode_current - 1 if "episode_current" in payload else episode_current)
+            current = episode_index * step_total + step_current
+            total = episode_total * step_total
+            source = "episode_step"
+            unit = "step"
+
+    if current is None:
+        current = _progress_number(payload, "current", "current_step", "completed", "completed_steps")
+        total = _progress_number(payload, "total", "total_steps", "target")
+        if total is None:
+            total = config_total_work
+        if current is not None and total is not None and total > 0:
+            source = "current_total" if "total" in payload or "total_steps" in payload else "config_total"
+            unit = "step"
+
+    if percent_value is not None:
+        percent = percent_value * 100.0 if 0 <= percent_value <= 1 else percent_value
+        percent = max(0.0, min(100.0, percent))
+        if current is None and total is None:
+            return {"percent": percent, "source": "percent", "unit": "percent"}
+    elif current is not None and total is not None and total > 0:
+        percent = max(0.0, min(100.0, (current / total) * 100.0))
+    else:
+        return {"percent": None, "source": None, "unit": None}
+
+    return {
+        "percent": percent,
+        "current": current,
+        "total": total,
+        "source": source or "percent",
+        "unit": unit,
+    }
+
+
+def _job_runtime_elapsed_seconds(tracked: dict, *, now_ts: float) -> float | None:
+    elapsed = _ensure_float(_compute_job_durations(tracked, now_ts=now_ts).get("run_duration_seconds"))
+    return max(0.0, elapsed) if elapsed is not None else None
+
+
+def _progress_eta(job_id: str, payload: dict) -> dict:
+    tracked = _normalized_job_meta(job_id, jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {}, persist=True)
+    status_payload = _read_status_payload(job_id) or {}
+    status = status_payload.get("status") or tracked.get("status")
+
+    if status != JobStatus.RUNNING.value:
+        return {
+            "available": False,
+            "reason": "job_not_running",
+            "source": None,
+        }
+
+    now_ts = time.time()
+    elapsed = _job_runtime_elapsed_seconds(tracked, now_ts=now_ts)
+
+    progress = _progress_fraction(payload)
+    percent = progress.get("percent")
+    config_source = None
+    if percent is None and elapsed is not None:
+        config_total_work, config_source = _eta_total_work_from_config(_load_eta_config(job_id, tracked))
+        progress = _progress_fraction(payload, config_total_work=config_total_work)
+        percent = progress.get("percent")
+    if percent is None:
+        return {"available": False, "reason": "progress_unavailable", "source": None}
+
+    if percent >= 100:
+        return {
+            "available": True,
+            "state": "complete",
+            "eta_seconds": 0,
+            "estimated_finish_at": time.time(),
+            "source": progress.get("source"),
+            "confidence": "progress",
+            "progress_percent": 100.0,
+            "current": progress.get("current"),
+            "total": progress.get("total"),
+            "unit": progress.get("unit"),
+        }
+
+    if percent <= 0:
+        return {
+            "available": False,
+            "reason": "progress_not_started",
+            "source": progress.get("source"),
+            "progress_percent": percent,
+            "current": progress.get("current"),
+            "total": progress.get("total"),
+            "unit": progress.get("unit"),
+        }
+
+    if elapsed is None:
+        return {
+            "available": False,
+            "reason": "runtime_unavailable",
+            "source": progress.get("source"),
+            "progress_percent": percent,
+            "current": progress.get("current"),
+            "total": progress.get("total"),
+            "unit": progress.get("unit"),
+        }
+
+    fraction = percent / 100.0
+    eta_seconds = max(0.0, elapsed * ((1.0 - fraction) / fraction))
+    updated_at = _progress_timestamp(payload)
+    confidence = "progress_rate"
+    if config_source and progress.get("source") in {"config_total", "current_total"}:
+        confidence = "progress_rate_config_total"
+
+    return {
+        "available": True,
+        "state": "running",
+        "eta_seconds": eta_seconds,
+        "estimated_finish_at": now_ts + eta_seconds,
+        "elapsed_seconds": elapsed,
+        "source": progress.get("source"),
+        "confidence": confidence,
+        "progress_percent": percent,
+        "current": progress.get("current"),
+        "total": progress.get("total"),
+        "unit": progress.get("unit"),
+        "updated_at": updated_at,
+    }
+
+
+def _enrich_progress_payload(job_id: str, payload: dict) -> dict:
+    enriched = dict(payload)
+    eta = _progress_eta(job_id, enriched)
+    enriched["eta"] = eta
+    if eta.get("available"):
+        enriched["eta_seconds"] = eta.get("eta_seconds")
+        enriched["estimated_finish_at"] = eta.get("estimated_finish_at")
+        enriched["eta_source"] = eta.get("source")
+        enriched["eta_confidence"] = eta.get("confidence")
+    return enriched
+
+
+def _queue_estimate_payload(
+    *,
+    available: bool,
+    reason: str,
+    target_host: str | None = None,
+    profile: str | None = None,
+    estimated_start_at: float | None = None,
+    now_ts: float | None = None,
+    blocking_job_id: str | None = None,
+    queue_position: int | None = None,
+) -> dict:
+    payload = {
+        "available": available,
+        "kind": "estimated_start",
+        "reason": reason,
+        "source": "orchestrator_queue",
+        "target_host": target_host,
+        "profile": profile,
+        "estimated_start_at": estimated_start_at if available else None,
+        "estimated_start_seconds": (
+            max(0.0, estimated_start_at - (now_ts or time.time()))
+            if available and estimated_start_at is not None
+            else None
+        ),
+    }
+    if blocking_job_id:
+        payload["blocking_job_id"] = blocking_job_id
+    if queue_position is not None:
+        payload["queue_position"] = queue_position
+    return payload
+
+
+def _queue_target_group(entry: dict, meta: dict) -> tuple[tuple[str, str], str, str | None] | None:
+    job_id = entry.get("job_id")
+    preferred = entry.get("preferred_host") or meta.get("preferred_host") or meta.get("target_host")
+    require_host = bool(entry.get("require_host", meta.get("require_host", bool(preferred))))
+    if not isinstance(job_id, str) or not job_id:
+        return None
+    if not isinstance(preferred, str) or not preferred.strip() or not require_host:
+        return None
+    host = preferred.strip()
+    if host == "deucalion":
+        profile = _deucalion_job_profile(job_id, meta)
+        return (host, profile), host, profile
+    return (host, "default"), host, None
+
+
+def _queue_group_capacity(host: str, profile: str | None) -> int:
+    if host == "deucalion":
+        limits = _deucalion_profile_limits()
+        return max(0, int(limits.get(profile or "cpu", 0)))
+
+    hb = host_heartbeats.get(host)
+    info = hb.get("info") if isinstance(hb, dict) and isinstance(hb.get("info"), dict) else {}
+    configured = _as_positive_int(info.get("max_active_jobs"))
+    return configured if configured is not None else 1
+
+
+def _queue_group_online(host: str, active_job_ids: list[str], *, now_ts: float) -> bool:
+    hb = host_heartbeats.get(host)
+    if isinstance(hb, dict) and (now_ts - float(hb.get("last_seen", 0) or 0)) <= settings.HOST_HEARTBEAT_TTL:
+        return True
+    return bool(active_job_ids)
+
+
+def _queue_group_active_job_ids(host: str, profile: str | None) -> list[str]:
+    if host == "deucalion":
+        return _deucalion_active_job_ids_by_profile().get(profile or "cpu", [])
+    return _active_job_ids_for_host(host)
+
+
+def _active_job_estimated_finish_at(job_id: str) -> float | None:
+    meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {})
+    status = _read_status_file(job_id) or meta.get("status")
+    if status != JobStatus.RUNNING.value:
+        return None
+    payload = file_utils.read_progress(job_id)
+    if not isinstance(payload, dict):
+        payload = {"progress": payload}
+    eta = _progress_eta(job_id, payload)
+    if not eta.get("available"):
+        return None
+    estimated_finish_at = _ensure_float(eta.get("estimated_finish_at"))
+    if estimated_finish_at is None:
+        return None
+    return max(time.time(), estimated_finish_at)
+
+
+def _first_queued_start_estimate(
+    *,
+    host: str,
+    profile: str | None,
+    now_ts: float,
+    queue_position: int,
+) -> dict:
+    capacity = _queue_group_capacity(host, profile)
+    active_job_ids = _queue_group_active_job_ids(host, profile)
+    if capacity <= 0:
+        return _queue_estimate_payload(
+            available=False,
+            reason="no_capacity",
+            target_host=host,
+            profile=profile,
+            now_ts=now_ts,
+            queue_position=queue_position,
+        )
+
+    if len(active_job_ids) < capacity:
+        if not _queue_group_online(host, active_job_ids, now_ts=now_ts):
+            return _queue_estimate_payload(
+                available=False,
+                reason="host_unavailable",
+                target_host=host,
+                profile=profile,
+                now_ts=now_ts,
+                queue_position=queue_position,
+            )
+        return _queue_estimate_payload(
+            available=True,
+            reason="slot_available",
+            target_host=host,
+            profile=profile,
+            estimated_start_at=now_ts,
+            now_ts=now_ts,
+            queue_position=queue_position,
+        )
+
+    finishes: list[tuple[str, float]] = []
+    for active_job_id in active_job_ids:
+        finish_at = _active_job_estimated_finish_at(active_job_id)
+        if finish_at is None:
+            return _queue_estimate_payload(
+                available=False,
+                reason="active_eta_unavailable",
+                target_host=host,
+                profile=profile,
+                now_ts=now_ts,
+                blocking_job_id=active_job_id,
+                queue_position=queue_position,
+            )
+        finishes.append((active_job_id, finish_at))
+
+    blocking_job_id, estimated_start_at = min(finishes, key=lambda item: item[1])
+    return _queue_estimate_payload(
+        available=True,
+        reason="waiting_for_active_job",
+        target_host=host,
+        profile=profile,
+        estimated_start_at=estimated_start_at,
+        now_ts=now_ts,
+        blocking_job_id=blocking_job_id,
+        queue_position=queue_position,
+    )
+
+
+def _queued_start_estimates(queue_entries: list[dict] | None = None, *, now_ts: float | None = None) -> dict[str, dict]:
+    now = now_ts or time.time()
+    entries = queue_entries if queue_entries is not None else job_utils.list_queue()
+    tracked = jobs if jobs else job_utils.load_jobs()
+    group_counts: dict[tuple[str, str], int] = {}
+    estimates: dict[str, dict] = {}
+
+    for entry in entries:
+        job_id = entry.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            continue
+        meta = tracked.get(job_id) or {}
+        status = _read_status_file(job_id) or meta.get("status")
+        if status not in (JobStatus.QUEUED.value, JobStatus.LAUNCHING.value):
+            estimates[job_id] = _queue_estimate_payload(
+                available=False,
+                reason="job_not_queued",
+                now_ts=now,
+            )
+            continue
+
+        target = _queue_target_group(entry, meta)
+        if target is None:
+            estimates[job_id] = _queue_estimate_payload(
+                available=False,
+                reason="target_ambiguous",
+                now_ts=now,
+            )
+            continue
+
+        group_key, host, profile = target
+        queue_position = group_counts.get(group_key, 0) + 1
+        group_counts[group_key] = queue_position
+
+        if queue_position > 1:
+            estimates[job_id] = _queue_estimate_payload(
+                available=False,
+                reason="queued_behind_job",
+                target_host=host,
+                profile=profile,
+                now_ts=now,
+                queue_position=queue_position,
+            )
+            continue
+
+        estimates[job_id] = _first_queued_start_estimate(
+            host=host,
+            profile=profile,
+            now_ts=now,
+            queue_position=queue_position,
+        )
+
+    return estimates
 
 
 def _without_email_notification_metadata(payload: dict) -> dict:
@@ -488,6 +1293,7 @@ def _write_status(job_id: str, status: str, extra: dict | None = None):
             extra_payload.get("details") if isinstance(extra_payload.get("details"), dict) else {},
             status_ts=status_ts,
         )
+        _repair_active_lifecycle_metadata(jobs[job_id])
         job_utils.save_job(job_id, jobs[job_id])
     _notify_status_change(job_id, prev, status)
 
@@ -515,6 +1321,7 @@ def _force_status(job_id: str, status: str, extra: dict | None = None) -> None:
             extra_payload.get("details") if isinstance(extra_payload.get("details"), dict) else {},
             status_ts=status_ts,
         )
+        _repair_active_lifecycle_metadata(meta)
         job_utils.save_job(job_id, meta)
         jobs[job_id] = meta
     _notify_status_change(job_id, prev, status)
@@ -631,6 +1438,15 @@ def _validate_deucalion_walltime_options(options: dict | None) -> None:
         options["partition"] = partition
     else:
         limit = None
+
+    requested_gpus = _as_positive_int(options.get("gpus"))
+    if partition and _is_gpu_like_partition(partition):
+        if "gpus" not in options:
+            options["gpus"] = 1
+        elif requested_gpus is None:
+            raise HTTPException(400, f"deucalion_options.gpus must be > 0 for GPU partition '{partition}'")
+    elif partition and requested_gpus is not None and not _is_gpu_like_partition(partition):
+        raise HTTPException(400, f"deucalion_options.gpus requires a GPU partition, got '{partition}'")
 
     time_limit = options.get("time") or options.get("time_limit")
     if time_limit is None:
@@ -1017,6 +1833,63 @@ def _fetch_dockerhub_tags(repository: str, max_tags: int) -> tuple[list[dict], b
     return tags, False, fetched_at
 
 
+def _fetch_dockerhub_tag(repository: str, tag: str) -> tuple[dict | None, bool, float]:
+    repo = _normalize_image_repository(repository)
+    tag_name = str(tag or "").strip()
+    if not tag_name:
+        raise HTTPException(400, "Image tag is required")
+
+    cache_key = f"{repo}:tag:{tag_name}"
+    now = time.time()
+    ttl = max(0, int(settings.JOB_IMAGE_CATALOG_TTL_SECONDS))
+    cached = _image_versions_cache.get(cache_key)
+    if cached and (now - cached.get("fetched_at", 0.0)) < ttl:
+        return cached.get("tag"), True, cached["fetched_at"]
+
+    namespace, name = repo.split("/", 1)
+    url = (
+        "https://hub.docker.com/v2/repositories/"
+        f"{urllib_parse.quote(namespace)}/{urllib_parse.quote(name)}"
+        f"/tags/{urllib_parse.quote(tag_name, safe='')}"
+    )
+    req = urllib_request.Request(url, headers={"Accept": "application/json"})
+    timeout_seconds = max(1, int(settings.JOB_IMAGE_CATALOG_TIMEOUT_SECONDS))
+    try:
+        with urllib_request.urlopen(req, timeout=timeout_seconds) as resp:
+            raw = json.loads(resp.read().decode("utf-8"))
+    except urllib_error.HTTPError as exc:
+        if exc.code == 404:
+            fetched_at = time.time()
+            _image_versions_cache[cache_key] = {"tag": None, "fetched_at": fetched_at}
+            return None, False, fetched_at
+        raise HTTPException(502, f"Failed to fetch Docker Hub tag {repo}:{tag_name} (status={exc.code})")
+    except Exception as exc:
+        raise HTTPException(502, f"Failed to fetch Docker Hub tag {repo}:{tag_name}: {exc}")
+
+    payload = raw if isinstance(raw, dict) else {}
+    tag_payload = {
+        "name": payload.get("name") or tag_name,
+        "last_updated": payload.get("last_updated"),
+        "digest": _dockerhub_tag_digest(payload),
+    }
+    fetched_at = time.time()
+    _image_versions_cache[cache_key] = {"tag": tag_payload, "fetched_at": fetched_at}
+    return tag_payload, False, fetched_at
+
+
+def _validate_deucalion_sif_tag_available(image_tag: str) -> None:
+    sif_repo = _normalize_image_repository(settings.JOB_SIF_REPOSITORY)
+    tag_payload, _cached, _fetched_at = _fetch_dockerhub_tag(sif_repo, image_tag)
+    if tag_payload is None:
+        raise HTTPException(
+            400,
+            (
+                f"Image tag '{image_tag}' is not Deucalion-ready: "
+                f"SIF artifact '{sif_repo}:{image_tag}' was not found"
+            ),
+        )
+
+
 def list_job_image_versions(repository: Optional[str] = None, limit: Optional[int] = None) -> dict:
     repo = _normalize_image_repository(repository)
     sif_repo = _normalize_image_repository(settings.JOB_SIF_REPOSITORY)
@@ -1049,6 +1922,35 @@ def list_job_image_versions(repository: Optional[str] = None, limit: Optional[in
         "count": len(tags_with_readiness),
         "cached": bool(image_cached and sif_cached),
         "fetched_at": max(image_fetched_at, sif_fetched_at),
+    }
+
+
+def _dockerhub_repository_diagnostic(repository: Optional[str], limit: int = 5) -> dict:
+    repo_label = str(repository or "").strip().strip("/")
+    try:
+        repo = _normalize_image_repository(repository)
+        tags, cached, fetched_at = _fetch_dockerhub_tags(repo, max(1, min(int(limit), 20)))
+    except HTTPException as exc:
+        return {
+            "ok": False,
+            "repository": repo_label,
+            "status_code": exc.status_code,
+            "error": str(exc.detail),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "repository": repo_label,
+            "error": str(exc),
+        }
+
+    return {
+        "ok": True,
+        "repository": repo,
+        "cached": cached,
+        "fetched_at": fetched_at,
+        "sample_count": len(tags),
+        "sample_tags": [str(tag.get("name")) for tag in tags if isinstance(tag, dict) and tag.get("name")],
     }
 
 
@@ -1107,13 +2009,14 @@ def _should_preserve_deucalion_active_status(job_id: str, meta: dict, now_ts: fl
 
 def _reset_runtime_metadata(job_id: str, meta: dict) -> dict:
     cleaned = dict(meta)
-    for key in RUNTIME_RESET_FIELDS:
+    error_metadata_keys = set(ERROR_METADATA_KEYS)
+    for key in RUNTIME_RESET_FIELDS | ATTEMPT_LIFECYCLE_RESET_FIELDS | error_metadata_keys:
         cleaned.pop(key, None)
 
     info = _read_job_info_payload(job_id)
     if info:
         changed = False
-        for key in JOB_INFO_RUNTIME_RESET_FIELDS:
+        for key in JOB_INFO_RUNTIME_RESET_FIELDS | error_metadata_keys:
             if key in info:
                 info.pop(key, None)
                 changed = True
@@ -1418,8 +2321,11 @@ def _mark_stale_jobs():
                             submitted_by=meta.get("submitted_by"),
                         )
                     )
-                    meta["status"] = JobStatus.QUEUED.value
-                    _persist_job(job_id, meta)
+                    meta = _reset_runtime_metadata(job_id, meta)
+                    meta["preferred_host"] = preferred
+                    meta["require_host"] = require_host
+                    meta["target_host"] = preferred if require_host else None
+                    jobs[job_id] = meta
                     _write_status(
                         job_id,
                         JobStatus.QUEUED.value,
@@ -1454,8 +2360,11 @@ def _mark_stale_jobs():
                     submitted_by=meta.get("submitted_by"),
                 )
             )
-            meta["status"] = JobStatus.QUEUED.value
-            _persist_job(job_id, meta)
+            meta = _reset_runtime_metadata(job_id, meta)
+            meta["preferred_host"] = preferred
+            meta["require_host"] = require_host
+            meta["target_host"] = preferred if require_host else None
+            jobs[job_id] = meta
             _write_status(job_id, JobStatus.QUEUED.value, {"requeued_from": host, "preferred_host": preferred})
             _LOGGER.warning("Re-queued stale dispatched job %s from offline host %s", job_id, host)
         elif status in (JobStatus.RUNNING.value, JobStatus.STOP_REQUESTED.value):
@@ -1512,6 +2421,8 @@ async def launch_simulation(request: JobLaunchRequest):
     if deucalion_options and preferred_host != "deucalion":
         raise HTTPException(400, "deucalion_options are only allowed when target_host is 'deucalion'")
     _validate_deucalion_walltime_options(deucalion_options)
+    if preferred_host == "deucalion":
+        _validate_deucalion_sif_tag_available(image_tag)
 
     if not config_path.startswith("configs/"):
         config_path = f"configs/{config_path}"
@@ -1597,7 +2508,10 @@ def get_result(job_id: str):
     return payload
 
 def get_progress(job_id: str):
-    return file_utils.read_progress(job_id)
+    payload = file_utils.read_progress(job_id)
+    if not isinstance(payload, dict):
+        payload = {"progress": payload}
+    return _enrich_progress_payload(job_id, payload)
 
 def get_job_resolved_config(job_id: str) -> str:
     path = _resolved_config_path(job_id)
@@ -1779,6 +2693,8 @@ def stop_job(job_id: str, reason: str = "stop_requested", requested_by_ops: bool
 def list_jobs():
     _refresh_jobs()
     _mark_stale_jobs()
+    queue_entries = job_utils.list_queue()
+    queued_start_estimates = _queued_start_estimates(queue_entries)
     result = []
     for job_id, job in jobs.items():
         merged = dict(job)
@@ -1808,47 +2724,58 @@ def list_jobs():
         status_payload = get_status(job_id)
         status = status_payload["status"]
         merged["status"] = status
+        merged = _normalized_job_meta(job_id, merged, persist=True)
         if "config_path" in merged and not _is_yaml_filename(str(merged["config_path"])):
             # Keep backward compatibility but normalize config extension when legacy jobs exist.
             merged["config_path"] = str(merged["config_path"])
         durations = _compute_job_durations(merged)
-        result.append(
-            {
-                "job_id": job_id,
-                "status": status,
-                "job_info": info,
-                "submitted_at": merged.get("submitted_at"),
-                "queued_at": merged.get("queued_at"),
-                "dispatched_at": merged.get("dispatched_at"),
-                "started_at": merged.get("started_at"),
-                "stop_requested_at": merged.get("stop_requested_at"),
-                "finished_at": merged.get("finished_at"),
-                "last_status_at": merged.get("last_status_at") or status_payload.get("last_status_at"),
-                "queue_wait_seconds": durations.get("queue_wait_seconds"),
-                "run_duration_seconds": durations.get("run_duration_seconds"),
-                "total_duration_seconds": durations.get("total_duration_seconds"),
-                "requeue_count": int(merged.get("requeue_count", 0) or 0),
-                "attempt_number": int(merged.get("attempt_number", 0) or 0),
-                "job_meta": _without_email_notification_metadata(merged),
-            }
-        )
+        entry = {
+            "job_id": job_id,
+            "status": status,
+            "job_info": info,
+            "submitted_at": merged.get("submitted_at"),
+            "queued_at": merged.get("queued_at"),
+            "dispatched_at": merged.get("dispatched_at"),
+            "started_at": merged.get("started_at"),
+            "stop_requested_at": merged.get("stop_requested_at"),
+            "finished_at": merged.get("finished_at"),
+            "last_status_at": merged.get("last_status_at") or status_payload.get("last_status_at"),
+            "queue_wait_seconds": durations.get("queue_wait_seconds"),
+            "run_duration_seconds": durations.get("run_duration_seconds"),
+            "total_duration_seconds": durations.get("total_duration_seconds"),
+            "requeue_count": int(merged.get("requeue_count", 0) or 0),
+            "attempt_number": int(merged.get("attempt_number", 0) or 0),
+            "job_meta": _without_email_notification_metadata(merged),
+        }
+        queued_start_estimate = queued_start_estimates.get(job_id)
+        if queued_start_estimate:
+            entry["queued_start_estimate"] = queued_start_estimate
+            if queued_start_estimate.get("available"):
+                entry["estimated_start_at"] = queued_start_estimate.get("estimated_start_at")
+                entry["estimated_start_seconds"] = queued_start_estimate.get("estimated_start_seconds")
+        result.append(entry)
     return result
 
 
 def list_queue():
     _mark_stale_jobs()
     entries = job_utils.list_queue()
+    queued_start_estimates = _queued_start_estimates(entries)
     tracked = jobs if jobs else job_utils.load_jobs()
     for entry in entries:
-        if entry.get("submitted_by"):
-            continue
         job_id = entry.get("job_id")
         if not job_id:
             continue
         meta = tracked.get(job_id) or {}
-        submitted_by = meta.get("submitted_by")
-        if submitted_by:
+        if not entry.get("submitted_by") and meta.get("submitted_by"):
+            submitted_by = meta.get("submitted_by")
             entry["submitted_by"] = submitted_by
+        queued_start_estimate = queued_start_estimates.get(job_id)
+        if queued_start_estimate:
+            entry["queued_start_estimate"] = queued_start_estimate
+            if queued_start_estimate.get("available"):
+                entry["estimated_start_at"] = queued_start_estimate.get("estimated_start_at")
+                entry["estimated_start_seconds"] = queued_start_estimate.get("estimated_start_seconds")
     return entries
 
 def get_job_info(job_id: str):
@@ -1860,7 +2787,7 @@ def get_job_info(job_id: str):
     with open(p) as f:
         info = json.load(f)
     info = _enrich_job_info_with_mlflow_links(info)
-    meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {})
+    meta = _normalized_job_meta(job_id, jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {}, persist=True)
     resolved_path = _resolved_config_path(job_id)
     info.setdefault("resolved_config_available", os.path.isfile(resolved_path))
     if info["resolved_config_available"]:
@@ -1881,6 +2808,7 @@ def get_job_info(job_id: str):
         info["email_notifications"] = meta.get("email_notifications")
 
     # Expose lifecycle timing in job details overview.
+    status_payload = _read_status_payload(job_id) or {}
     durations = _compute_job_durations(meta) if meta else {}
     lifecycle_keys = (
         "submitted_at",
@@ -1892,12 +2820,39 @@ def get_job_info(job_id: str):
         "last_status_at",
     )
     for key in lifecycle_keys:
-        if key not in info and key in meta:
+        if key in meta:
             info[key] = meta.get(key)
+        elif key in info:
+            info.pop(key, None)
     if durations:
-        info.setdefault("queue_wait_seconds", durations.get("queue_wait_seconds"))
-        info.setdefault("run_duration_seconds", durations.get("run_duration_seconds"))
-        info.setdefault("total_duration_seconds", durations.get("total_duration_seconds"))
+        info["queue_wait_seconds"] = durations.get("queue_wait_seconds")
+        info["run_duration_seconds"] = durations.get("run_duration_seconds")
+        info["total_duration_seconds"] = durations.get("total_duration_seconds")
+
+    if not all(key in info for key in ERROR_METADATA_KEYS):
+        details = {}
+        if isinstance(info.get("details"), dict):
+            details = info["details"]
+        elif isinstance(status_payload.get("details"), dict):
+            details = status_payload["details"]
+        elif isinstance(meta.get("details"), dict):
+            details = meta["details"]
+        error_extra = {
+            "error": info.get("error") or status_payload.get("error") or meta.get("error"),
+            "details": details,
+        }
+        _enrich_error_metadata(
+            job_id,
+            info.get("status") or status_payload.get("status") or meta.get("status"),
+            error_extra,
+        )
+        for key in ERROR_METADATA_KEYS:
+            if key in error_extra:
+                info.setdefault(key, error_extra[key])
+        if isinstance(info.get("details"), dict) and isinstance(error_extra.get("details"), dict):
+            for key in ERROR_METADATA_KEYS:
+                if key in error_extra["details"]:
+                    info["details"].setdefault(key, error_extra["details"][key])
 
     return info
 
@@ -1919,6 +2874,121 @@ def get_hosts():
     return {
         "available_hosts": settings.AVAILABLE_HOSTS,
         "hosts": _host_status_snapshot(),
+    }
+
+
+def get_deucalion_diagnostics() -> dict:
+    _refresh_jobs()
+    _mark_stale_jobs()
+    now = time.time()
+    hosts = _host_status_snapshot()
+    host = hosts.get("deucalion")
+    hb = host_heartbeats.get("deucalion")
+    heartbeat_age_seconds = (now - hb["last_seen"]) if hb else None
+
+    profile_limits = _deucalion_profile_limits()
+    active_ids_by_profile = _deucalion_active_job_ids_by_profile()
+    active_jobs: list[dict] = []
+    for profile, job_ids in active_ids_by_profile.items():
+        for job_id in job_ids:
+            meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {})
+            status_payload = _read_status_payload(job_id) or {}
+            details = status_payload.get("details") if isinstance(status_payload.get("details"), dict) else {}
+            active_jobs.append(
+                {
+                    "job_id": job_id,
+                    "profile": profile,
+                    "status": status_payload.get("status") or meta.get("status"),
+                    "job_name": meta.get("job_name"),
+                    "image_tag": meta.get("image_tag"),
+                    "slurm_job_id": details.get("slurm_job_id"),
+                    "slurm_state": details.get("slurm_state"),
+                    "slurm_reason": details.get("slurm_reason"),
+                    "slurm_partition": details.get("slurm_partition"),
+                    "queue_position": details.get("slurm_queue_position"),
+                    "jobs_ahead": details.get("slurm_jobs_ahead"),
+                    "executor_stage": details.get("executor_stage"),
+                    "last_status_at": meta.get("last_status_at") or status_payload.get("status_updated_at"),
+                }
+            )
+
+    tracked = jobs if jobs else job_utils.load_jobs()
+    queue_entries: list[dict] = []
+    for entry in job_utils.list_queue():
+        job_id = entry.get("job_id")
+        if not isinstance(job_id, str) or not job_id:
+            continue
+        meta = tracked.get(job_id) or {}
+        preferred = entry.get("preferred_host") or meta.get("preferred_host") or meta.get("target_host")
+        if preferred != "deucalion":
+            continue
+        queue_entries.append(
+            {
+                "job_id": job_id,
+                "job_name": meta.get("job_name"),
+                "profile": _deucalion_job_profile(job_id, meta),
+                "status": _read_status_file(job_id) or meta.get("status"),
+                "image_tag": meta.get("image_tag"),
+                "preferred_host": preferred,
+                "require_host": entry.get("require_host", meta.get("require_host")),
+                "enqueued_at": entry.get("enqueued_at"),
+                "submitted_by": entry.get("submitted_by") or meta.get("submitted_by"),
+            }
+        )
+
+    checks = {
+        "configured": {
+            "ok": "deucalion" in settings.AVAILABLE_HOSTS,
+            "available_hosts": settings.AVAILABLE_HOSTS,
+        },
+        "heartbeat": {
+            "ok": bool(host and host.get("online")),
+            "last_seen": hb.get("last_seen") if hb else None,
+            "age_seconds": heartbeat_age_seconds,
+            "ttl_seconds": settings.HOST_HEARTBEAT_TTL,
+        },
+        "image_repository": _dockerhub_repository_diagnostic(settings.JOB_IMAGE_REPOSITORY),
+        "sif_repository": _dockerhub_repository_diagnostic(settings.JOB_SIF_REPOSITORY),
+    }
+
+    raw_info = (hb.get("info") if hb else {}) if isinstance(hb, dict) else {}
+    if not isinstance(raw_info, dict):
+        raw_info = {}
+    checks["budget"] = {
+        "ok": bool(raw_info.get("budget")),
+        "refreshed_at": raw_info.get("budget_refreshed_at"),
+    }
+
+    issues: list[str] = []
+    if not checks["configured"]["ok"]:
+        issues.append("deucalion_not_configured")
+    if not checks["heartbeat"]["ok"]:
+        issues.append("deucalion_worker_offline")
+    if not checks["sif_repository"]["ok"]:
+        issues.append("sif_repository_unreachable")
+    if not checks["image_repository"]["ok"]:
+        issues.append("image_repository_unreachable")
+
+    return {
+        "generated_at": now,
+        "ok": not issues,
+        "issues": issues,
+        "checks": checks,
+        "host": host,
+        "worker_info": raw_info,
+        "limits": {
+            "max_active_jobs_by_profile": profile_limits,
+            "partition_limits": get_deucalion_partition_limits(),
+        },
+        "active": {
+            "count_by_profile": {profile: len(active_ids_by_profile.get(profile, [])) for profile in profile_limits},
+            "job_ids_by_profile": active_ids_by_profile,
+            "jobs": active_jobs,
+        },
+        "queue": {
+            "count": len(queue_entries),
+            "entries": queue_entries,
+        },
     }
 
 
@@ -1959,11 +3029,10 @@ def ops_requeue_job(
         )
     )
 
-    meta["status"] = JobStatus.QUEUED.value
     meta["preferred_host"] = preferred
     meta["require_host"] = require_host
     meta["target_host"] = preferred if require_host else None
-    _persist_job(job_id, meta)
+    jobs[job_id] = meta
 
     extra = {
         "requeued_by_ops": True,
@@ -2292,9 +3361,8 @@ def _agent_next_job_locked(worker_id: str):
         job_queue_entry.get("preferred_host"),
     )
 
-    meta["status"] = JobStatus.DISPATCHED.value
     meta["target_host"] = worker_id
-    _persist_job(job_id, meta)
+    jobs[job_id] = meta
 
     _write_status(job_id, JobStatus.DISPATCHED.value, {"worker_id": worker_id})
 
@@ -2335,6 +3403,7 @@ def agent_update_status(job_id: str, status: str, extra: dict | None = None):
         status,
         sorted(extra.keys()),
     )
+    _enrich_error_metadata(job_id, status, extra)
     try:
         _write_status(job_id, status, extra)
     except ValueError as exc:
@@ -2378,7 +3447,7 @@ def agent_update_status(job_id: str, status: str, extra: dict | None = None):
             _persist_job(job_id, meta)
 
     # If agent provided container info, persist to job_info.json and job_track.json
-    if {"container_id", "container_name", "exit_code", "error", "details"} & extra.keys():
+    if {"container_id", "container_name", "exit_code", "error", "details", *ERROR_METADATA_KEYS} & extra.keys():
         info_path = _info_path(job_id)
         info = {}
         if os.path.exists(info_path):
@@ -2394,6 +3463,9 @@ def agent_update_status(job_id: str, status: str, extra: dict | None = None):
             info["exit_code"] = extra["exit_code"]
         if "error" in extra:
             info["error"] = extra["error"]
+        for key in ERROR_METADATA_KEYS:
+            if key in extra:
+                info[key] = extra[key]
         if "details" in extra and isinstance(extra["details"], dict):
             info["details"] = extra["details"]
         with open(info_path, "w") as f:
@@ -2411,6 +3483,9 @@ def agent_update_status(job_id: str, status: str, extra: dict | None = None):
                 updated["exit_code"] = extra["exit_code"]
             if "error" in extra:
                 updated["error"] = extra["error"]
+            for key in ERROR_METADATA_KEYS:
+                if key in extra:
+                    updated[key] = extra[key]
             if "details" in extra and isinstance(extra["details"], dict):
                 updated["details"] = extra["details"]
             _persist_job(job_id, updated)
@@ -2426,6 +3501,9 @@ def agent_update_status(job_id: str, status: str, extra: dict | None = None):
                 meta["exit_code"] = extra["exit_code"]
             if "error" in extra:
                 meta["error"] = extra["error"]
+            for key in ERROR_METADATA_KEYS:
+                if key in extra:
+                    meta[key] = extra[key]
             if "details" in extra and isinstance(extra["details"], dict):
                 meta["details"] = extra["details"]
             _persist_job(job_id, meta)
