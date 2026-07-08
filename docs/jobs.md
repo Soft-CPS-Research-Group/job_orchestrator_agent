@@ -40,6 +40,8 @@ Created by the API when a job is queued. Contains only scheduling metadata:
 - `job_id`: string
 - `preferred_host`: string or null
 - `require_host`: boolean
+- optional `target_worker_profile`: `"cpu"` or `"gpu"` for automatic host
+  selection constrained to CPU-only or GPU-capable workers.
 
 Workers should NOT read queue files directly. Use `/api/agent/next-job`.
 
@@ -100,6 +102,9 @@ Repeated updates with the same status are accepted (idempotent).
 
 ### Job submission and inspection
 - `POST /run-simulation` (server only)
+  - Optional body field `target_worker_profile: "cpu"|"gpu"` constrains
+    automatic host selection without pinning a specific host. It cannot be
+    combined with `target_host`.
 - `GET /status/{job_id}`
 - `GET /job-info/{job_id}`
 - `GET /jobs` (all jobs)
@@ -117,6 +122,10 @@ Repeated updates with the same status are accepted (idempotent).
 - `POST /api/agent/next-job`
   - Body: `{ "worker_id": "tiago-gpu" }`
   - Response: 200 + job payload or 204 if no job is available
+  - Automatic dispatch skips CPU-only workers for jobs whose config declares GPU
+    requirements (`require_cuda`, `cuda_required`, `require_gpu`, `gpus`,
+    `device: cuda`, etc.). Launch requests with `target_worker_profile="gpu"`
+    require a GPU-capable worker even if the config has no GPU marker.
   - Special case: `worker_id="deucalion"` only receives jobs explicitly
     targeted to `deucalion` (`target_host` required).
 

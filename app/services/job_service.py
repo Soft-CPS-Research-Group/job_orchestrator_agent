@@ -1528,6 +1528,7 @@ def _truthy_config_value(value: Any) -> bool:
 def _config_value_requests_gpu(key: Any, value: Any) -> bool:
     key_text = str(key).strip().lower()
     if key_text in {
+        "cuda_required",
         "require_cuda",
         "requires_cuda",
         "require_gpu",
@@ -1561,7 +1562,7 @@ def _config_requires_gpu(payload: Any) -> bool:
 
 def _job_requires_gpu(job_id: str, meta: dict | None = None) -> bool:
     metadata = meta or jobs.get(job_id) or {}
-    for key in ("require_cuda", "requires_cuda", "require_gpu", "requires_gpu", "gpu_required"):
+    for key in ("cuda_required", "require_cuda", "requires_cuda", "require_gpu", "requires_gpu", "gpu_required"):
         if _truthy_config_value(metadata.get(key)):
             return True
     if _payload_indicates_gpu(metadata.get("deucalion_options")):
@@ -1580,6 +1581,19 @@ def _worker_supports_gpu(worker_id: str) -> bool:
         if _truthy_config_value(info.get(key)):
             return True
     return False
+
+
+def _normalize_target_worker_profile(value: Any) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise HTTPException(400, "target_worker_profile must be 'cpu' or 'gpu'")
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+    if normalized not in {"cpu", "gpu"}:
+        raise HTTPException(400, "target_worker_profile must be 'cpu' or 'gpu'")
+    return normalized
 
 
 def _deucalion_job_profile(job_id: str, meta: dict | None = None) -> str:
@@ -1686,6 +1700,15 @@ def _can_dispatch_to_worker(
         return True
 
     meta = jobs.get(job_id) or {}
+    target_worker_profile = _normalize_target_worker_profile(
+        queue_payload.get("target_worker_profile") or meta.get("target_worker_profile")
+    )
+    if target_worker_profile == "gpu" and not _worker_supports_gpu(worker_id):
+        _LOGGER.info("Worker %s does not advertise GPU support; keeping GPU-targeted job %s queued", worker_id, job_id)
+        return False
+    if target_worker_profile == "cpu" and _worker_supports_gpu(worker_id):
+        _LOGGER.info("Worker %s advertises GPU support; keeping CPU-targeted job %s queued", worker_id, job_id)
+        return False
     if _job_requires_gpu(job_id, meta) and not _worker_supports_gpu(worker_id):
         _LOGGER.info("Worker %s does not advertise GPU support; keeping GPU job %s queued", worker_id, job_id)
         return False
@@ -2244,6 +2267,7 @@ def _queue_payload(
     preferred_host: str | None,
     require_host: bool,
     submitted_by: str | None = None,
+    target_worker_profile: str | None = None,
 ) -> dict:
     payload: dict = {
         "job_id": job_id,
@@ -2252,6 +2276,8 @@ def _queue_payload(
     }
     if submitted_by:
         payload["submitted_by"] = submitted_by
+    if target_worker_profile:
+        payload["target_worker_profile"] = target_worker_profile
     return payload
 
 
@@ -2470,6 +2496,7 @@ def _mark_stale_jobs():
                             preferred_host=preferred,
                             require_host=require_host,
                             submitted_by=meta.get("submitted_by"),
+                            target_worker_profile=meta.get("target_worker_profile"),
                         )
                     )
                     meta = _reset_runtime_metadata(job_id, meta)
@@ -2510,6 +2537,7 @@ def _mark_stale_jobs():
                     preferred_host=preferred,
                     require_host=require_host,
                     submitted_by=meta.get("submitted_by"),
+                    target_worker_profile=meta.get("target_worker_profile"),
                 )
             )
             meta = _reset_runtime_metadata(job_id, meta)
@@ -2533,6 +2561,9 @@ async def launch_simulation(request: JobLaunchRequest):
         raise HTTPException(503, "No hosts configured")
 
     preferred_host = _preferred_host(request.target_host)
+    target_worker_profile = _normalize_target_worker_profile(request.target_worker_profile)
+    if preferred_host and target_worker_profile:
+        raise HTTPException(400, "target_worker_profile is only allowed with automatic host selection")
     job_id = str(uuid4())
 
     # config
@@ -2558,6 +2589,8 @@ async def launch_simulation(request: JobLaunchRequest):
         raise HTTPException(400, "Invalid config format")
     _validate_executor_agnostic_config(config)
     runtime_config, runtime_config_changed = _resolve_runtime_config(config)
+    if target_worker_profile == "cpu" and _config_requires_gpu(runtime_config):
+        raise HTTPException(400, "Config requires GPU; choose Any GPU or a GPU-capable host")
 
     experiment_name, run_name = _resolve_experiment_identity(runtime_config)
     requested_job_name = (request.job_name or "").strip()
@@ -2592,6 +2625,7 @@ async def launch_simulation(request: JobLaunchRequest):
         "run_name": run_name,
         "status": JobStatus.LAUNCHING.value,
         "require_host": bool(preferred_host),
+        "target_worker_profile": target_worker_profile,
         "submitted_by": submitted_by,
         "image_tag": image_tag,
         "image": job_image,
@@ -2611,8 +2645,13 @@ async def launch_simulation(request: JobLaunchRequest):
         image_tag=image_tag,
         image=job_image,
         deucalion_options=deucalion_options,
+        target_worker_profile=target_worker_profile,
     )
-    _write_status(job_id, JobStatus.LAUNCHING.value, {"preferred_host": preferred_host})
+    _write_status(
+        job_id,
+        JobStatus.LAUNCHING.value,
+        {"preferred_host": preferred_host, "target_worker_profile": target_worker_profile},
+    )
 
     # enqueue for agent (agent decides how to run the container)
     job_utils.enqueue_job(
@@ -2621,15 +2660,21 @@ async def launch_simulation(request: JobLaunchRequest):
             preferred_host=preferred_host,
             require_host=bool(preferred_host),
             submitted_by=submitted_by,
+            target_worker_profile=target_worker_profile,
         )
     )
     meta.update({"status": JobStatus.QUEUED.value})
     _persist_job(job_id, meta)
-    _write_status(job_id, JobStatus.QUEUED.value, {"preferred_host": preferred_host})
+    _write_status(
+        job_id,
+        JobStatus.QUEUED.value,
+        {"preferred_host": preferred_host, "target_worker_profile": target_worker_profile},
+    )
     return {
         "job_id": job_id,
         "status": JobStatus.QUEUED.value,
         "host": preferred_host,
+        "target_worker_profile": target_worker_profile,
         "job_name": job_name,
         "image_tag": image_tag,
         "image": job_image,
@@ -2870,6 +2915,7 @@ def list_jobs():
         info.setdefault("job_name", merged.get("job_name"))
         info.setdefault("config_path", merged.get("config_path"))
         info.setdefault("target_host", merged.get("target_host"))
+        info.setdefault("target_worker_profile", merged.get("target_worker_profile"))
         info.setdefault("image_tag", merged.get("image_tag"))
         info.setdefault("deucalion_options", merged.get("deucalion_options"))
         info.setdefault("image", merged.get("image") or settings.DEFAULT_JOB_IMAGE)
@@ -2924,6 +2970,8 @@ def list_queue():
         if not entry.get("submitted_by") and meta.get("submitted_by"):
             submitted_by = meta.get("submitted_by")
             entry["submitted_by"] = submitted_by
+        if not entry.get("target_worker_profile") and meta.get("target_worker_profile"):
+            entry["target_worker_profile"] = meta.get("target_worker_profile")
         queued_start_estimate = queued_start_estimates.get(job_id)
         if queued_start_estimate:
             entry["queued_start_estimate"] = queued_start_estimate
@@ -3183,6 +3231,7 @@ def ops_requeue_job(
             preferred_host=preferred,
             require_host=require_host,
             submitted_by=meta.get("submitted_by"),
+            target_worker_profile=meta.get("target_worker_profile"),
         )
     )
 
@@ -3487,6 +3536,7 @@ def _agent_next_job_locked(worker_id: str):
         "config_path": runtime_config_path,
         "source_config_path": config_path,
         "preferred_host": job_queue_entry.get("preferred_host"),
+        "target_worker_profile": meta.get("target_worker_profile") or job_queue_entry.get("target_worker_profile"),
         "image": _normalize_job_image(meta.get("image")),
         "image_tag": meta.get("image_tag"),
         "deucalion_options": meta.get("deucalion_options") if worker_id == "deucalion" else None,
@@ -3521,7 +3571,11 @@ def _agent_next_job_locked(worker_id: str):
     meta["target_host"] = worker_id
     jobs[job_id] = meta
 
-    _write_status(job_id, JobStatus.DISPATCHED.value, {"worker_id": worker_id})
+    _write_status(
+        job_id,
+        JobStatus.DISPATCHED.value,
+        {"worker_id": worker_id, "target_worker_profile": response.get("target_worker_profile")},
+    )
 
     info_path = _info_path(job_id)
     info = {}
@@ -3537,6 +3591,8 @@ def _agent_next_job_locked(worker_id: str):
         info["image"] = response["image"]
     if "image_tag" not in info and response.get("image_tag"):
         info["image_tag"] = response["image_tag"]
+    if response.get("target_worker_profile") and "target_worker_profile" not in info:
+        info["target_worker_profile"] = response["target_worker_profile"]
     if worker_id == "deucalion" and response.get("deucalion_options") and "deucalion_options" not in info:
         info["deucalion_options"] = response["deucalion_options"]
     with open(info_path, "w") as f:

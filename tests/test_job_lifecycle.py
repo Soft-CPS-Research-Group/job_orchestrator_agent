@@ -1230,6 +1230,126 @@ def test_unpinned_gpu_job_skips_cpu_worker_and_waits_for_gpu_worker():
     assert not queue_file.exists()
 
 
+def test_any_gpu_job_skips_cpu_worker_even_without_gpu_config():
+    settings.AVAILABLE_HOSTS = ["server", "tiago-laptop", "deucalion"]
+    job_service.record_host_heartbeat("server", {"executor": "docker", "gpu_enabled": False})
+    job_service.record_host_heartbeat("tiago-laptop", {"executor": "docker", "gpu_enabled": True})
+    job_service.record_host_heartbeat("deucalion", {"executor": "deucalion"})
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "AnyGpu", "run_name": "ManualChoice"}},
+                target_worker_profile="gpu",
+            )
+        )
+    )
+    job_id = result["job_id"]
+    queue_file = Path(settings.QUEUE_DIR) / f"{job_id}.json"
+    queue_payload = json.loads(queue_file.read_text())
+    assert queue_payload["target_worker_profile"] == "gpu"
+
+    assert job_service.agent_next_job("deucalion") is None
+    assert job_service.agent_next_job("server") is None
+
+    dispatched = job_service.agent_next_job("tiago-laptop")
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
+    assert dispatched["target_worker_profile"] == "gpu"
+    assert not queue_file.exists()
+
+
+def test_any_cpu_job_skips_gpu_worker():
+    settings.AVAILABLE_HOSTS = ["server", "tiago-laptop"]
+    job_service.record_host_heartbeat("server", {"executor": "docker", "gpu_enabled": False})
+    job_service.record_host_heartbeat("tiago-laptop", {"executor": "docker", "gpu_enabled": True})
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "AnyCpu", "run_name": "ManualChoice"}},
+                target_worker_profile="cpu",
+            )
+        )
+    )
+    job_id = result["job_id"]
+    queue_file = Path(settings.QUEUE_DIR) / f"{job_id}.json"
+    assert queue_file.exists()
+
+    assert job_service.agent_next_job("tiago-laptop") is None
+
+    dispatched = job_service.agent_next_job("server")
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
+    assert dispatched["target_worker_profile"] == "cpu"
+    assert not queue_file.exists()
+
+
+def test_target_worker_profile_rejects_explicit_host():
+    settings.AVAILABLE_HOSTS = ["server"]
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={"experiment": {"name": "Bad", "run_name": "ProfileHost"}},
+                    target_host="server",
+                    target_worker_profile="cpu",
+                )
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "automatic host selection" in str(exc.value.detail)
+
+
+def test_any_cpu_rejects_config_that_requires_gpu():
+    settings.AVAILABLE_HOSTS = ["server", "tiago-laptop"]
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={
+                        "experiment": {"name": "Bad", "run_name": "CpuForGpu"},
+                        "algorithm": {"require_cuda": True},
+                    },
+                    target_worker_profile="cpu",
+                )
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "requires GPU" in str(exc.value.detail)
+
+
+def test_automatic_dispatch_detects_cuda_required_alias():
+    settings.AVAILABLE_HOSTS = ["server", "tiago-laptop"]
+    job_service.record_host_heartbeat("server", {"executor": "docker", "gpu_enabled": False})
+    job_service.record_host_heartbeat("tiago-laptop", {"executor": "docker", "gpu_enabled": True})
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={
+                    "metadata": {"experiment_name": "AutoGpu", "run_name": "CudaRequiredAlias"},
+                    "tracking": {"tags": {"cuda_required": True}},
+                },
+            )
+        )
+    )
+    job_id = result["job_id"]
+    queue_file = Path(settings.QUEUE_DIR) / f"{job_id}.json"
+    assert queue_file.exists()
+
+    assert job_service.agent_next_job("server") is None
+
+    dispatched = job_service.agent_next_job("tiago-laptop")
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
+    assert not queue_file.exists()
+
+
 def test_deucalion_picks_only_explicit_deucalion_jobs():
     settings.AVAILABLE_HOSTS = ["worker-a", "deucalion"]
 

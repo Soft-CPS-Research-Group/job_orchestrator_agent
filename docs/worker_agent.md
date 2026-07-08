@@ -10,9 +10,15 @@ are documented in `docs/jobs.md`.
   - `job_id`
   - `preferred_host`: string or `null`
   - `require_host`: boolean (true if the requester targeted a specific host)
+  - optional `target_worker_profile`: `"cpu"` or `"gpu"` when automatic host
+    selection was constrained to a compute profile.
 - Agents obtain work by POSTing to `/api/agent/next-job` with their
   `worker_id`. The server returns the first job whose host requirement is
-  satisfied (matching host for required jobs, or any host for optional jobs).
+  satisfied (matching host for required jobs, or any eligible host for
+  automatic jobs).
+- Automatic GPU jobs are only dispatched to workers whose heartbeat advertises
+  GPU support. Workers should set `info.gpu_enabled=true` (or another supported
+  GPU flag such as `has_gpu`/`cuda_available`) when they can run CUDA/GPU jobs.
 - Special case: worker `deucalion` is strict and only receives jobs explicitly
   pinned to `target_host="deucalion"` (host required).
 - The response to `/api/agent/next-job` includes the fully populated payload

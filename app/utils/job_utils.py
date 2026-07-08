@@ -85,6 +85,7 @@ def save_job_info(
     image_tag: str | None = None,
     image: str | None = None,
     deucalion_options: dict | None = None,
+    target_worker_profile: str | None = None,
 ):
     job_dir = os.path.join(settings.JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
@@ -108,6 +109,8 @@ def save_job_info(
         info["image"] = image
     if deucalion_options:
         info["deucalion_options"] = deucalion_options
+    if target_worker_profile:
+        info["target_worker_profile"] = target_worker_profile
     with open(os.path.join(job_dir, "job_info.json"), "w") as f:
         json.dump(info, f, indent=2)
 
@@ -202,6 +205,8 @@ def enqueue_job(payload: dict):
         "require_host": payload.get("require_host", bool(payload.get("preferred_host"))),
         "enqueued_at": payload.get("enqueued_at") or time.time(),
     }
+    if payload.get("target_worker_profile"):
+        entry["target_worker_profile"] = payload["target_worker_profile"]
     if payload.get("submitted_by"):
         entry["submitted_by"] = payload["submitted_by"]
     with open(path, "w") as f:

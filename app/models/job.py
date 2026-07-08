@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Dict, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -24,6 +24,7 @@ class JobLaunchRequest(BaseModel):
     config: Optional[Dict] = None
     config_path: Optional[str] = None
     target_host: Optional[str] = None
+    target_worker_profile: Optional[Literal["cpu", "gpu"]] = None
     save_as: Optional[str] = None
     job_name: Optional[str] = None
     submitted_by: Optional[str] = None
