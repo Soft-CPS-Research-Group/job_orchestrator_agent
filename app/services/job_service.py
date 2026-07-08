@@ -821,13 +821,27 @@ def _eta_total_work_from_config(config: dict) -> tuple[float | None, str | None]
 
 def _progress_fraction(payload: dict, config_total_work: float | None = None) -> dict:
     percent_keys = ("progress_pct", "percent", "progress_percent", "completion")
-    percent_value = _progress_number(payload, *percent_keys)
+    percent_value = None
+    percent_key = None
+    for key in percent_keys:
+        value = _progress_number(payload, key)
+        if value is not None:
+            percent_value = value
+            percent_key = key
+            break
     if percent_value is None and isinstance(payload.get("progress"), dict):
-        percent_value = _progress_number(payload["progress"], "percent", "value", "progress")
+        for key in ("percent", "value", "progress"):
+            value = _progress_number(payload["progress"], key)
+            if value is not None:
+                percent_value = value
+                percent_key = f"progress.{key}"
+                break
     elif percent_value is None:
         raw_progress = payload.get("progress")
         if not isinstance(raw_progress, str):
             percent_value = _number_value(raw_progress)
+            if percent_value is not None:
+                percent_key = "progress"
 
     current = None
     total = None
@@ -878,13 +892,16 @@ def _progress_fraction(payload: dict, config_total_work: float | None = None) ->
             source = "current_total" if "total" in payload or "total_steps" in payload else "config_total"
             unit = "step"
 
-    if percent_value is not None:
-        percent = percent_value * 100.0 if 0 <= percent_value <= 1 else percent_value
-        percent = max(0.0, min(100.0, percent))
-        if current is None and total is None:
-            return {"percent": percent, "source": "percent", "unit": "percent"}
-    elif current is not None and total is not None and total > 0:
+    if current is not None and total is not None and total > 0:
         percent = max(0.0, min(100.0, (current / total) * 100.0))
+    elif percent_value is not None:
+        percent = (
+            percent_value
+            if percent_key in {"progress_pct", "progress_percent"}
+            else percent_value * 100.0 if 0 <= percent_value <= 1 else percent_value
+        )
+        percent = max(0.0, min(100.0, percent))
+        return {"percent": percent, "source": percent_key or "percent", "unit": "percent"}
     else:
         return {"percent": None, "source": None, "unit": None}
 
@@ -1498,6 +1515,73 @@ def _payload_indicates_gpu(payload: Any) -> bool:
     return False
 
 
+def _truthy_config_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value > 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+
+def _config_value_requests_gpu(key: Any, value: Any) -> bool:
+    key_text = str(key).strip().lower()
+    if key_text in {
+        "require_cuda",
+        "requires_cuda",
+        "require_gpu",
+        "requires_gpu",
+        "gpu_required",
+        "use_cuda",
+        "use_gpu",
+    }:
+        return _truthy_config_value(value)
+    if key_text in {"gpus", "gpu_count", "gpus_per_task"}:
+        return _as_positive_int(value) is not None
+    if key_text in {"device", "torch_device", "accelerator"} and isinstance(value, str):
+        normalized = value.strip().lower()
+        return "cuda" in normalized or normalized in {"gpu", "mps"}
+    return False
+
+
+def _config_requires_gpu(payload: Any) -> bool:
+    if isinstance(payload, dict):
+        if _payload_indicates_gpu(payload):
+            return True
+        for key, value in payload.items():
+            if _config_value_requests_gpu(key, value):
+                return True
+            if isinstance(value, (dict, list)) and _config_requires_gpu(value):
+                return True
+    elif isinstance(payload, list):
+        return any(_config_requires_gpu(item) for item in payload)
+    return False
+
+
+def _job_requires_gpu(job_id: str, meta: dict | None = None) -> bool:
+    metadata = meta or jobs.get(job_id) or {}
+    for key in ("require_cuda", "requires_cuda", "require_gpu", "requires_gpu", "gpu_required"):
+        if _truthy_config_value(metadata.get(key)):
+            return True
+    if _payload_indicates_gpu(metadata.get("deucalion_options")):
+        return True
+    return _config_requires_gpu(_load_eta_config(job_id, metadata))
+
+
+def _worker_supports_gpu(worker_id: str) -> bool:
+    if worker_id == "deucalion":
+        return True
+    hb = host_heartbeats.get(worker_id)
+    info = hb.get("info") if isinstance(hb, dict) else None
+    if not isinstance(info, dict):
+        return False
+    for key in ("gpu_enabled", "gpu_required", "has_gpu", "gpu", "cuda_available"):
+        if _truthy_config_value(info.get(key)):
+            return True
+    return False
+
+
 def _deucalion_job_profile(job_id: str, meta: dict | None = None) -> str:
     metadata = meta or jobs.get(job_id) or {}
     info = _read_job_info_payload(job_id)
@@ -1586,6 +1670,26 @@ def _can_dispatch_to_deucalion(queue_payload: dict, active_counts: dict[str, int
             limits.get(profile, 0),
         )
     return allowed
+
+
+def _can_dispatch_to_worker(
+    worker_id: str,
+    queue_payload: dict,
+    *,
+    deucalion_active_counts: dict[str, int] | None = None,
+) -> bool:
+    if worker_id == "deucalion":
+        return _can_dispatch_to_deucalion(queue_payload, deucalion_active_counts)
+
+    job_id = queue_payload.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        return True
+
+    meta = jobs.get(job_id) or {}
+    if _job_requires_gpu(job_id, meta) and not _worker_supports_gpu(worker_id):
+        _LOGGER.info("Worker %s does not advertise GPU support; keeping GPU job %s queued", worker_id, job_id)
+        return False
+    return True
 
 
 def _preferred_host(requested: Optional[str]) -> Optional[str]:
@@ -1970,6 +2074,17 @@ def _status_stale_ttl(meta: dict, status: str) -> int:
     return ttl
 
 
+def _worker_stale_grace_seconds(host: str) -> int:
+    remote_hosts = {str(item).strip() for item in getattr(settings, "REMOTE_WORKER_HOSTS", []) if str(item).strip()}
+    if host in remote_hosts:
+        return max(int(settings.WORKER_STALE_GRACE_SECONDS), int(settings.REMOTE_WORKER_STALE_GRACE_SECONDS))
+    return int(settings.WORKER_STALE_GRACE_SECONDS)
+
+
+def _worker_heartbeat_cutoff(host: str) -> int:
+    return int(settings.HOST_HEARTBEAT_TTL) + _worker_stale_grace_seconds(host)
+
+
 def _should_preserve_heartbeat_active_status(job_id: str, meta: dict, now_ts: float) -> bool:
     host = str(meta.get("target_host") or meta.get("preferred_host") or "")
     if not host:
@@ -1980,7 +2095,7 @@ def _should_preserve_heartbeat_active_status(job_id: str, meta: dict, now_ts: fl
     last_seen = hb.get("last_seen")
     if not isinstance(last_seen, (int, float)):
         return False
-    cutoff = settings.HOST_HEARTBEAT_TTL + settings.WORKER_STALE_GRACE_SECONDS
+    cutoff = _worker_heartbeat_cutoff(host)
     if (now_ts - float(last_seen)) > cutoff:
         return False
 
@@ -2015,7 +2130,7 @@ def _should_preserve_deucalion_active_status(job_id: str, meta: dict, now_ts: fl
     last_seen = hb.get("last_seen")
     if not isinstance(last_seen, (int, float)):
         return False
-    cutoff = settings.HOST_HEARTBEAT_TTL + settings.WORKER_STALE_GRACE_SECONDS
+    cutoff = _worker_heartbeat_cutoff("deucalion")
     if (now_ts - float(last_seen)) > cutoff:
         return False
 
@@ -2330,7 +2445,6 @@ def _simulation_data_metadata(job_id: str, result_payload: dict) -> dict:
 def _mark_stale_jobs():
     """Detect jobs stuck on offline workers and requeue or fail them."""
     now = time.time()
-    cutoff = settings.HOST_HEARTBEAT_TTL + settings.WORKER_STALE_GRACE_SECONDS
     for job_id, meta in list(jobs.items()):
         status = meta.get("status")
         host = meta.get("target_host")
@@ -2382,6 +2496,7 @@ def _mark_stale_jobs():
         last_seen = hb["last_seen"] if hb else None
         if last_seen is None:
             continue  # no heartbeat recorded yet; give it a chance
+        cutoff = _worker_heartbeat_cutoff(str(host))
         offline = (now - last_seen) > cutoff
         if not offline:
             continue
@@ -3046,7 +3161,10 @@ def ops_requeue_job(
     if preferred_host:
         if not job_utils.is_valid_host(preferred_host):
             raise HTTPException(400, f"Unknown host '{preferred_host}'. Allowed: {settings.AVAILABLE_HOSTS}")
-    preferred = preferred_host or meta.get("preferred_host") or meta.get("target_host")
+    if require_host is False and preferred_host is None:
+        preferred = None
+    else:
+        preferred = preferred_host or meta.get("preferred_host") or meta.get("target_host")
     if require_host is None:
         require_host = bool(meta.get("require_host", bool(preferred)))
 
@@ -3318,10 +3436,10 @@ def _agent_next_job_locked(worker_id: str):
     deucalion_active_counts = _deucalion_active_counts_by_profile() if worker_id == "deucalion" else None
     job_queue_entry = job_utils.agent_pop_next_job(
         worker_id,
-        can_accept=(
-            (lambda payload: _can_dispatch_to_deucalion(payload, deucalion_active_counts))
-            if worker_id == "deucalion"
-            else None
+        can_accept=lambda payload: _can_dispatch_to_worker(
+            worker_id,
+            payload,
+            deucalion_active_counts=deucalion_active_counts,
         ),
     )
     if not job_queue_entry:

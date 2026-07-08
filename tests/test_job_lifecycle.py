@@ -668,6 +668,39 @@ def test_get_progress_adds_eta_from_step_totals(monkeypatch):
     assert payload["eta_seconds"] == pytest.approx(100.0)
 
 
+def test_get_progress_prefers_step_totals_over_fraction_like_progress_pct(monkeypatch):
+    job_id = "job-progress-pct-with-step-totals"
+    now = 1_000.0
+    monkeypatch.setattr(job_service.time, "time", lambda: now)
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.RUNNING.value,
+        "started_at": now - 300,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps({"job_id": job_id, "status": JobStatus.RUNNING.value}))
+    (progress_dir / "progress.json").write_text(
+        json.dumps(
+            {
+                "global_step": 1024,
+                "global_step_total": 140160,
+                "progress_pct": 0.7306,
+                "timestamp": now - 5,
+            }
+        )
+    )
+
+    payload = job_service.get_progress(job_id)
+
+    assert payload["eta"]["available"] is True
+    assert payload["eta"]["progress_percent"] == pytest.approx((1024 / 140160) * 100)
+    assert payload["eta"]["progress_percent"] < 1
+    assert payload["eta"]["eta_seconds"] > 10_000
+
+
 def test_get_progress_adds_eta_from_config_total_when_progress_has_only_current(monkeypatch):
     job_id = "job-progress-config-total"
     now = 2_000.0
@@ -1162,6 +1195,36 @@ def test_deucalion_does_not_pick_unpinned_jobs():
 
     # Generic workers can still consume unpinned jobs.
     dispatched = job_service.agent_next_job("worker-a")
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
+    assert not queue_file.exists()
+
+
+def test_unpinned_gpu_job_skips_cpu_worker_and_waits_for_gpu_worker():
+    settings.AVAILABLE_HOSTS = ["server", "tiago-laptop"]
+    job_service.record_host_heartbeat("server", {"executor": "docker", "gpu_enabled": False})
+    job_service.record_host_heartbeat("tiago-laptop", {"executor": "docker", "gpu_enabled": True})
+
+    config_payload = {
+        "experiment": {"name": "GpuAuto", "run_name": "NeedsCuda"},
+        "algorithm": {
+            "name": "matd3",
+            "require_cuda": True,
+        },
+    }
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(config=config_payload)
+        )
+    )
+    job_id = result["job_id"]
+    queue_file = Path(settings.QUEUE_DIR) / f"{job_id}.json"
+    assert queue_file.exists()
+
+    assert job_service.agent_next_job("server") is None
+    assert queue_file.exists()
+
+    dispatched = job_service.agent_next_job("tiago-laptop")
     assert dispatched is not None
     assert dispatched["job_id"] == job_id
     assert not queue_file.exists()
@@ -1859,6 +1922,93 @@ def test_mark_stale_running_preserved_while_worker_heartbeat_reports_active(monk
     assert track[job_id]["status"] == JobStatus.RUNNING.value
 
 
+def test_mark_stale_remote_running_uses_remote_grace(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["tiago-laptop"]
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+    monkeypatch.setattr(settings, "HOST_HEARTBEAT_TTL", 1)
+    monkeypatch.setattr(settings, "WORKER_STALE_GRACE_SECONDS", 1)
+    monkeypatch.setattr(settings, "REMOTE_WORKER_HOSTS", ["tiago-laptop"])
+    monkeypatch.setattr(settings, "REMOTE_WORKER_STALE_GRACE_SECONDS", 60)
+
+    job_id = "job-remote-running-heartbeat"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "tiago-laptop",
+        "status": JobStatus.RUNNING.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "status": JobStatus.RUNNING.value,
+                "status_updated_at": time.time() - 10,
+            }
+        )
+    )
+    job_service.host_heartbeats["tiago-laptop"] = {
+        "last_seen": time.time() - 20,
+        "info": {
+            "active_job_id": job_id,
+            "active_job_ids": [job_id],
+            "active_jobs": [{"job_id": job_id, "status": JobStatus.RUNNING.value, "phase": "running"}],
+        },
+    }
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.RUNNING.value
+    track = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
+    assert track[job_id]["status"] == JobStatus.RUNNING.value
+
+
+def test_mark_stale_remote_running_fails_after_remote_grace(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["tiago-laptop"]
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+    monkeypatch.setattr(settings, "HOST_HEARTBEAT_TTL", 1)
+    monkeypatch.setattr(settings, "WORKER_STALE_GRACE_SECONDS", 1)
+    monkeypatch.setattr(settings, "REMOTE_WORKER_HOSTS", ["tiago-laptop"])
+    monkeypatch.setattr(settings, "REMOTE_WORKER_STALE_GRACE_SECONDS", 30)
+
+    job_id = "job-remote-running-expired"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "tiago-laptop",
+        "status": JobStatus.RUNNING.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "status": JobStatus.RUNNING.value,
+                "status_updated_at": time.time() - 10,
+            }
+        )
+    )
+    job_service.host_heartbeats["tiago-laptop"] = {
+        "last_seen": time.time() - 120,
+        "info": {
+            "active_job_id": job_id,
+            "active_job_ids": [job_id],
+            "active_jobs": [{"job_id": job_id, "status": JobStatus.RUNNING.value, "phase": "running"}],
+        },
+    }
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.FAILED.value
+    assert status_data["error"] == "stale_status"
+    track = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
+    assert track[job_id]["status"] == JobStatus.FAILED.value
+
+
 def test_mark_stale_deucalion_dispatched_pending_is_preserved(monkeypatch):
     settings.AVAILABLE_HOSTS = ["deucalion"]
     monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
@@ -1982,6 +2132,34 @@ def test_ops_requeue_dispatched():
         assert key not in info
     queue_file = Path(settings.QUEUE_DIR) / f"{job_id}.json"
     assert queue_file.exists()
+
+
+def test_ops_requeue_can_clear_required_host():
+    settings.AVAILABLE_HOSTS = ["worker-a", "worker-b"]
+    job_id = "job-ops-requeue-any-host"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "preferred_host": "worker-a",
+        "require_host": True,
+        "status": JobStatus.QUEUED.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(job_id, JobStatus.QUEUED.value, {})
+
+    resp = job_service.ops_requeue_job(job_id, require_host=False)
+
+    assert resp["status"] == JobStatus.QUEUED.value
+    tracked = json.loads(Path(settings.JOB_TRACK_FILE).read_text())[job_id]
+    assert tracked["preferred_host"] is None
+    assert tracked["target_host"] is None
+    assert tracked["require_host"] is False
+
+    queue_payload = json.loads((Path(settings.QUEUE_DIR) / f"{job_id}.json").read_text())
+    assert queue_payload["preferred_host"] is None
+    assert queue_payload["require_host"] is False
 
 
 def test_ops_requeue_running_requires_force():

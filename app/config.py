@@ -44,7 +44,7 @@ class Settings(BaseSettings):
     QUEUE_DIR: str = os.path.join(VM_SHARED_DATA, "queue")
     QUEUE_CLAIM_TTL: int = 300
 
-    AVAILABLE_HOSTS: list[str] = ["tiago-laptop", "local", "deucalion"]
+    AVAILABLE_HOSTS: list[str] = ["server", "deucalion", "tiago-laptop", "jetson-xavier", "local"]
     HOST_HEARTBEAT_TTL: int = 60
 
     DEFAULT_JOB_IMAGE: str = "calof/opeva_simulator:latest"
@@ -55,6 +55,8 @@ class Settings(BaseSettings):
     JOB_IMAGE_CATALOG_TIMEOUT_SECONDS: int = 10
     CONTAINER_NAME_PREFIX: str = "opeva_job"
     WORKER_STALE_GRACE_SECONDS: int = 120
+    REMOTE_WORKER_HOSTS: list[str] = ["tiago-laptop", "jetson-xavier"]
+    REMOTE_WORKER_STALE_GRACE_SECONDS: int = 1800
     JOB_STATUS_TTL: int = 300
     DEUCALION_DISPATCH_STATUS_TTL: int = 21600
     DEUCALION_MAX_ACTIVE_CPU_JOBS: int = 1
