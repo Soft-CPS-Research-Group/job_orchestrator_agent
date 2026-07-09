@@ -90,10 +90,12 @@ Common environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `VM_SHARED_DATA` | `/opt/opeva_shared_data` | Shared storage root. |
-| `AVAILABLE_HOSTS` | `["tiago-laptop","local","deucalion"]` | Valid worker IDs. |
+| `AVAILABLE_HOSTS` | `["server","deucalion","tiago-laptop","jetson-xavier","local"]` | Valid worker IDs. |
 | `DEFAULT_JOB_IMAGE` | `calof/opeva_simulator:latest` | Default image dispatched to workers. |
 | `JOB_IMAGE_REPOSITORY` | `calof/opeva_simulator` | Docker Hub repo queried by `/job-images/versions`. |
 | `JOB_SIF_REPOSITORY` | `calof/opeva_simulator_sif` | SIF image repo exposed to Deucalion flows. |
+| `JETSON_WORKER_HOSTS` | `["jetson-xavier"]` | Worker IDs that need Jetson-specific Docker image tags. |
+| `JETSON_IMAGE_TAG_SUFFIX` | `-jetson-r35.3.1` | Suffix appended to requested image tags before dispatching to Jetson workers. |
 | `MLFLOW_TRACKING_URI` | unset | Tracking URI injected into non-Deucalion jobs. |
 | `DEUCALION_MLFLOW_TRACKING_URI` | `file:/data/mlflow/mlruns` | Tracking URI injected into Deucalion jobs. |
 | `MLFLOW_UI_BASE_URL` | unset | Base URL used to build MLflow links in job info. |

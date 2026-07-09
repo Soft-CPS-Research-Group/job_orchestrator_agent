@@ -35,6 +35,8 @@ def jobs_env(tmp_path, monkeypatch):
         "QUEUE_DIR": settings.QUEUE_DIR,
         "JOB_TRACK_FILE": settings.JOB_TRACK_FILE,
         "AVAILABLE_HOSTS": list(settings.AVAILABLE_HOSTS),
+        "JETSON_WORKER_HOSTS": list(settings.JETSON_WORKER_HOSTS),
+        "JETSON_IMAGE_TAG_SUFFIX": settings.JETSON_IMAGE_TAG_SUFFIX,
         "MLFLOW_TRACKING_URI": settings.MLFLOW_TRACKING_URI,
         "DEUCALION_MLFLOW_TRACKING_URI": settings.DEUCALION_MLFLOW_TRACKING_URI,
         "MLFLOW_UI_BASE_URL": settings.MLFLOW_UI_BASE_URL,
@@ -1174,6 +1176,104 @@ def test_launch_with_custom_image_is_dispatched_to_worker():
     info = json.loads((Path(settings.JOBS_DIR) / job_id / "job_info.json").read_text())
     assert info["image"] == expected_image
     assert info["image_tag"] == image_tag
+
+
+def test_launch_to_jetson_dispatches_jetson_image_variant(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["jetson-xavier"]
+    settings.JETSON_WORKER_HOSTS = ["jetson-xavier"]
+    settings.JETSON_IMAGE_TAG_SUFFIX = "-jetson-r35.3.1"
+    image_tag = "sha-customv2"
+    jetson_tag = f"{image_tag}-jetson-r35.3.1"
+    expected_image = f"{settings.JOB_IMAGE_REPOSITORY}:{jetson_tag}"
+    checked_tags = []
+
+    def _fake_fetch_tag(repository: str, tag: str):
+        checked_tags.append((repository, tag))
+        return ({"name": tag}, False, 123.0) if tag == jetson_tag else (None, False, 123.0)
+
+    monkeypatch.setattr(job_service, "_fetch_dockerhub_tag", _fake_fetch_tag)
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Image", "run_name": "Jetson"}},
+                target_host="jetson-xavier",
+                image_tag=image_tag,
+            )
+        )
+    )
+
+    job_id = result["job_id"]
+    assert result["image_tag"] == image_tag
+    assert job_service.jobs[job_id]["image_tag"] == image_tag
+
+    dispatched = job_service.agent_next_job("jetson-xavier")
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
+    assert dispatched["image"] == expected_image
+    assert dispatched["image_tag"] == jetson_tag
+    assert dispatched["requested_image_tag"] == image_tag
+    assert (settings.JOB_IMAGE_REPOSITORY, jetson_tag) in checked_tags
+
+    info = json.loads((Path(settings.JOBS_DIR) / job_id / "job_info.json").read_text())
+    assert info["image"] == expected_image
+    assert info["image_tag"] == jetson_tag
+    assert info["requested_image_tag"] == image_tag
+
+
+def test_launch_to_jetson_rejects_missing_image_variant(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["jetson-xavier"]
+    settings.JETSON_WORKER_HOSTS = ["jetson-xavier"]
+    settings.JETSON_IMAGE_TAG_SUFFIX = "-jetson-r35.3.1"
+
+    monkeypatch.setattr(job_service, "_fetch_dockerhub_tag", lambda _repo, _tag: (None, False, 123.0))
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={"experiment": {"name": "Image", "run_name": "MissingJetson"}},
+                    target_host="jetson-xavier",
+                    image_tag="sha-missing",
+                )
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "not Jetson-ready" in str(exc.value.detail)
+    assert job_service.jobs == {}
+    assert not list(Path(settings.QUEUE_DIR).glob("*.json"))
+
+
+def test_automatic_jetson_skips_missing_image_variant(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["jetson-xavier", "worker-a"]
+    settings.JETSON_WORKER_HOSTS = ["jetson-xavier"]
+    settings.JETSON_IMAGE_TAG_SUFFIX = "-jetson-r35.3.1"
+    image_tag = "sha-worker"
+    expected_image = f"{settings.JOB_IMAGE_REPOSITORY}:{image_tag}"
+
+    monkeypatch.setattr(job_service, "_fetch_dockerhub_tag", lambda _repo, _tag: (None, False, 123.0))
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Image", "run_name": "AutomaticJetson"}},
+                image_tag=image_tag,
+            )
+        )
+    )
+    job_id = result["job_id"]
+    queue_file = Path(settings.QUEUE_DIR) / f"{job_id}.json"
+    assert queue_file.exists()
+
+    assert job_service.agent_next_job("jetson-xavier") is None
+    assert queue_file.exists()
+
+    dispatched = job_service.agent_next_job("worker-a")
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
+    assert dispatched["image"] == expected_image
+    assert dispatched["image_tag"] == image_tag
 
 
 def test_deucalion_does_not_pick_unpinned_jobs():

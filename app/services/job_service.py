@@ -1712,6 +1712,13 @@ def _can_dispatch_to_worker(
     if _job_requires_gpu(job_id, meta) and not _worker_supports_gpu(worker_id):
         _LOGGER.info("Worker %s does not advertise GPU support; keeping GPU job %s queued", worker_id, job_id)
         return False
+    if _is_jetson_worker(worker_id):
+        try:
+            image_tag = _normalize_image_tag(meta.get("image_tag"))
+            _validate_jetson_image_tag_available(image_tag)
+        except HTTPException as exc:
+            _LOGGER.info("Worker %s cannot accept job %s: %s", worker_id, job_id, exc.detail)
+            return False
     return True
 
 
@@ -1763,6 +1770,33 @@ def _normalize_image_tag(value: Optional[str]) -> str:
 def _resolve_job_image_from_tag(image_tag: str) -> str:
     repository = _normalize_image_repository(settings.JOB_IMAGE_REPOSITORY)
     return f"{repository}:{image_tag}"
+
+
+def _jetson_worker_hosts() -> set[str]:
+    return {str(host).strip() for host in (settings.JETSON_WORKER_HOSTS or []) if str(host).strip()}
+
+
+def _is_jetson_worker(worker_id: str | None) -> bool:
+    return str(worker_id or "").strip() in _jetson_worker_hosts()
+
+
+def _jetson_image_tag(image_tag: str) -> str:
+    tag = _normalize_image_tag(image_tag)
+    suffix = str(settings.JETSON_IMAGE_TAG_SUFFIX or "").strip()
+    if suffix and not tag.endswith(suffix):
+        return f"{tag}{suffix}"
+    return tag
+
+
+def _effective_image_tag_for_worker(worker_id: str, image_tag: str) -> str:
+    if _is_jetson_worker(worker_id):
+        return _jetson_image_tag(image_tag)
+    return _normalize_image_tag(image_tag)
+
+
+def _resolve_job_image_for_worker(worker_id: str, image_tag: str) -> tuple[str, str]:
+    effective_tag = _effective_image_tag_for_worker(worker_id, image_tag)
+    return _resolve_job_image_from_tag(effective_tag), effective_tag
 
 
 def _normalize_deucalion_options(value: Any) -> dict | None:
@@ -2025,6 +2059,20 @@ def _validate_deucalion_sif_tag_available(image_tag: str) -> None:
         )
 
 
+def _validate_jetson_image_tag_available(image_tag: str) -> None:
+    repo = _normalize_image_repository(settings.JOB_IMAGE_REPOSITORY)
+    jetson_tag = _jetson_image_tag(image_tag)
+    tag_payload, _cached, _fetched_at = _fetch_dockerhub_tag(repo, jetson_tag)
+    if tag_payload is None:
+        raise HTTPException(
+            400,
+            (
+                f"Image tag '{image_tag}' is not Jetson-ready: "
+                f"Docker image '{repo}:{jetson_tag}' was not found"
+            ),
+        )
+
+
 def list_job_image_versions(repository: Optional[str] = None, limit: Optional[int] = None) -> dict:
     repo = _normalize_image_repository(repository)
     sif_repo = _normalize_image_repository(settings.JOB_SIF_REPOSITORY)
@@ -2038,6 +2086,11 @@ def list_job_image_versions(repository: Optional[str] = None, limit: Optional[in
         for tag in sif_tags
         if isinstance(tag, dict) and isinstance(tag.get("name"), str)
     }
+    image_tag_names = {
+        str(tag.get("name"))
+        for tag in image_tags
+        if isinstance(tag, dict) and isinstance(tag.get("name"), str)
+    }
 
     tags_with_readiness: list[dict] = []
     for tag in image_tags:
@@ -2048,11 +2101,13 @@ def list_job_image_versions(repository: Optional[str] = None, limit: Optional[in
             continue
         merged = dict(tag)
         merged["deucalion_ready"] = tag_name in sif_tag_names
+        merged["jetson_ready"] = _jetson_image_tag(tag_name) in image_tag_names
         tags_with_readiness.append(merged)
 
     return {
         "repository": repo,
         "sif_repository": sif_repo,
+        "jetson_tag_suffix": str(settings.JETSON_IMAGE_TAG_SUFFIX or ""),
         "tags": tags_with_readiness,
         "count": len(tags_with_readiness),
         "cached": bool(image_cached and sif_cached),
@@ -2608,6 +2663,8 @@ async def launch_simulation(request: JobLaunchRequest):
     _validate_deucalion_walltime_options(deucalion_options)
     if preferred_host == "deucalion":
         _validate_deucalion_sif_tag_available(image_tag)
+    if _is_jetson_worker(preferred_host):
+        _validate_jetson_image_tag_available(image_tag)
 
     if not config_path.startswith("configs/"):
         config_path = f"configs/{config_path}"
@@ -3215,6 +3272,8 @@ def ops_requeue_job(
         preferred = preferred_host or meta.get("preferred_host") or meta.get("target_host")
     if require_host is None:
         require_host = bool(meta.get("require_host", bool(preferred)))
+    if require_host and _is_jetson_worker(preferred):
+        _validate_jetson_image_tag_available(_normalize_image_tag(meta.get("image_tag")))
 
     if not force:
         if status_now == JobStatus.FINISHED.value:
@@ -3529,6 +3588,8 @@ def _agent_next_job_locked(worker_id: str):
     )
     container_name = _container_name(job_id, job_name)
     command = f"--config {CONTAINER_DATA_ROOT}/{runtime_config_path} --job_id {job_id}"
+    requested_image_tag = _normalize_image_tag(meta.get("image_tag"))
+    dispatch_image, dispatch_image_tag = _resolve_job_image_for_worker(worker_id, requested_image_tag)
 
     response = {
         "job_id": job_id,
@@ -3537,8 +3598,9 @@ def _agent_next_job_locked(worker_id: str):
         "source_config_path": config_path,
         "preferred_host": job_queue_entry.get("preferred_host"),
         "target_worker_profile": meta.get("target_worker_profile") or job_queue_entry.get("target_worker_profile"),
-        "image": _normalize_job_image(meta.get("image")),
-        "image_tag": meta.get("image_tag"),
+        "image": dispatch_image,
+        "image_tag": dispatch_image_tag,
+        "requested_image_tag": requested_image_tag,
         "deucalion_options": meta.get("deucalion_options") if worker_id == "deucalion" else None,
         "command": command,
         "container_name": container_name,
@@ -3569,12 +3631,19 @@ def _agent_next_job_locked(worker_id: str):
     )
 
     meta["target_host"] = worker_id
+    meta["dispatched_image"] = response["image"]
+    meta["dispatched_image_tag"] = response["image_tag"]
     jobs[job_id] = meta
 
     _write_status(
         job_id,
         JobStatus.DISPATCHED.value,
-        {"worker_id": worker_id, "target_worker_profile": response.get("target_worker_profile")},
+        {
+            "worker_id": worker_id,
+            "target_worker_profile": response.get("target_worker_profile"),
+            "dispatched_image": response["image"],
+            "dispatched_image_tag": response["image_tag"],
+        },
     )
 
     info_path = _info_path(job_id)
@@ -3587,10 +3656,12 @@ def _agent_next_job_locked(worker_id: str):
         info["job_name"] = job_name
     if "config_path" not in info:
         info["config_path"] = config_path
-    if "image" not in info:
-        info["image"] = response["image"]
-    if "image_tag" not in info and response.get("image_tag"):
+    info["image"] = response["image"]
+    if response.get("image_tag"):
         info["image_tag"] = response["image_tag"]
+    if requested_image_tag and requested_image_tag != response.get("image_tag"):
+        info["requested_image_tag"] = requested_image_tag
+        info["requested_image"] = _resolve_job_image_from_tag(requested_image_tag)
     if response.get("target_worker_profile") and "target_worker_profile" not in info:
         info["target_worker_profile"] = response["target_worker_profile"]
     if worker_id == "deucalion" and response.get("deucalion_options") and "deucalion_options" not in info:
