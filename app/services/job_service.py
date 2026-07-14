@@ -1,5 +1,5 @@
 # app/services/job_service.py
-import os, re, json, yaml, time, logging, shutil, fcntl, copy
+import os, re, json, yaml, time, logging, shutil, fcntl, copy, hashlib, hmac, secrets, threading, weakref
 from uuid import uuid4
 from typing import Any, Generator, Optional
 from pathlib import Path
@@ -23,6 +23,8 @@ host_heartbeats: dict[str, dict] = {}
 HEARTBEAT_TTL = settings.HOST_HEARTBEAT_TTL  # backward compatibility for tests
 
 _LOGGER = logging.getLogger(__name__)
+_job_state_locks_guard = threading.Lock()
+_job_state_locks = weakref.WeakValueDictionary()
 
 CAPACITY_COUNT_STATUSES = {
     JobStatus.DISPATCHED.value,
@@ -53,6 +55,8 @@ DEFAULT_JOB_CLEANUP_KEEP = {
 }
 EMAIL_NOTIFICATION_HISTORY_LIMIT = 20
 EMAIL_NOTIFICATION_METADATA_KEYS = {"last_email_notification", "email_notifications"}
+ATTEMPT_FENCING_CAPABILITY = "attempt_fencing_v1"
+INTERNAL_JOB_METADATA_KEYS = {"attempt_token_hash"}
 
 RUNTIME_RESET_FIELDS = {
     "container_id",
@@ -118,6 +122,8 @@ DEUCALION_PARTITION_LIMITS_BY_NAME = {
 }
 
 _image_versions_cache: dict[str, dict] = {}
+_progress_eta_cache: dict[str, dict[str, Any]] = {}
+_PROGRESS_ETA_CACHE_MAX_ENTRIES = 512
 _LOG_CHUNK_DEFAULT_TAIL_LINES = 200
 _LOG_CHUNK_DEFAULT_MAX_BYTES = 256 * 1024
 _LOG_CHUNK_MAX_BYTES_LIMIT = 2 * 1024 * 1024
@@ -277,6 +283,23 @@ def _dispatch_lock(worker_id: str):
             yield
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+@contextmanager
+def _job_state_lock(job_id: str):
+    """Serialize state transitions for one job across threads and API processes."""
+    with _job_state_locks_guard:
+        thread_lock = _job_state_locks.setdefault(job_id, threading.RLock())
+    with thread_lock:
+        lock_dir = _job_dir(job_id)
+        os.makedirs(lock_dir, exist_ok=True)
+        lock_path = os.path.join(lock_dir, ".state.lock")
+        with open(lock_path, "a+") as lock_file:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 def _job_dir(job_id: str) -> str:
     return os.path.join(settings.JOBS_DIR, job_id)
@@ -925,11 +948,21 @@ def _progress_eta(job_id: str, payload: dict) -> dict:
     status = status_payload.get("status") or tracked.get("status")
 
     if status != JobStatus.RUNNING.value:
+        _progress_eta_cache.pop(job_id, None)
         return {
             "available": False,
             "reason": "job_not_running",
             "source": None,
         }
+
+    signature = (
+        _ensure_float(tracked.get("started_at")),
+        int(tracked.get("attempt_number", 0) or 0),
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str),
+    )
+    cached = _progress_eta_cache.get(job_id)
+    if cached and cached.get("signature") == signature:
+        return copy.deepcopy(cached["eta"])
 
     now_ts = time.time()
     elapsed = _job_runtime_elapsed_seconds(tracked, now_ts=now_ts)
@@ -942,14 +975,16 @@ def _progress_eta(job_id: str, payload: dict) -> dict:
         progress = _progress_fraction(payload, config_total_work=config_total_work)
         percent = progress.get("percent")
     if percent is None:
-        return {"available": False, "reason": "progress_unavailable", "source": None}
+        eta = {"available": False, "reason": "progress_unavailable", "source": None}
+        _cache_progress_eta(job_id, signature, eta)
+        return eta
 
     if percent >= 100:
-        return {
+        eta = {
             "available": True,
             "state": "complete",
             "eta_seconds": 0,
-            "estimated_finish_at": time.time(),
+            "estimated_finish_at": now_ts,
             "source": progress.get("source"),
             "confidence": "progress",
             "progress_percent": 100.0,
@@ -957,9 +992,11 @@ def _progress_eta(job_id: str, payload: dict) -> dict:
             "total": progress.get("total"),
             "unit": progress.get("unit"),
         }
+        _cache_progress_eta(job_id, signature, eta)
+        return eta
 
     if percent <= 0:
-        return {
+        eta = {
             "available": False,
             "reason": "progress_not_started",
             "source": progress.get("source"),
@@ -968,9 +1005,11 @@ def _progress_eta(job_id: str, payload: dict) -> dict:
             "total": progress.get("total"),
             "unit": progress.get("unit"),
         }
+        _cache_progress_eta(job_id, signature, eta)
+        return eta
 
     if elapsed is None:
-        return {
+        eta = {
             "available": False,
             "reason": "runtime_unavailable",
             "source": progress.get("source"),
@@ -979,6 +1018,8 @@ def _progress_eta(job_id: str, payload: dict) -> dict:
             "total": progress.get("total"),
             "unit": progress.get("unit"),
         }
+        _cache_progress_eta(job_id, signature, eta)
+        return eta
 
     fraction = percent / 100.0
     eta_seconds = max(0.0, elapsed * ((1.0 - fraction) / fraction))
@@ -987,7 +1028,7 @@ def _progress_eta(job_id: str, payload: dict) -> dict:
     if config_source and progress.get("source") in {"config_total", "current_total"}:
         confidence = "progress_rate_config_total"
 
-    return {
+    eta = {
         "available": True,
         "state": "running",
         "eta_seconds": eta_seconds,
@@ -1000,6 +1041,19 @@ def _progress_eta(job_id: str, payload: dict) -> dict:
         "total": progress.get("total"),
         "unit": progress.get("unit"),
         "updated_at": updated_at,
+    }
+    _cache_progress_eta(job_id, signature, eta)
+    return eta
+
+
+def _cache_progress_eta(job_id: str, signature: tuple, eta: dict) -> None:
+    if len(_progress_eta_cache) >= _PROGRESS_ETA_CACHE_MAX_ENTRIES and job_id not in _progress_eta_cache:
+        oldest_job_id = next(iter(_progress_eta_cache), None)
+        if oldest_job_id is not None:
+            _progress_eta_cache.pop(oldest_job_id, None)
+    _progress_eta_cache[job_id] = {
+        "signature": signature,
+        "eta": copy.deepcopy(eta),
     }
 
 
@@ -1229,6 +1283,13 @@ def _without_email_notification_metadata(payload: dict) -> dict:
     return {key: value for key, value in payload.items() if key not in EMAIL_NOTIFICATION_METADATA_KEYS}
 
 
+def _public_job_metadata(payload: dict) -> dict:
+    sanitized = _without_email_notification_metadata(payload)
+    for key in INTERNAL_JOB_METADATA_KEYS:
+        sanitized.pop(key, None)
+    return sanitized
+
+
 def _status_notification_meta(job_id: str, status: str) -> dict[str, Any]:
     meta = dict(jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {})
     status_payload = _read_status_payload(job_id) or {}
@@ -1284,6 +1345,58 @@ def _notify_status_change(job_id: str, previous_status: str | None, status: str)
     _append_email_notification_record(job_id, record)
 
 
+def _attempt_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _invalidate_attempt_fence(job_id: str, invalidated_at: float) -> None:
+    meta = jobs.get(job_id)
+    if not isinstance(meta, dict) or meta.get("attempt_fencing_enabled") is not True:
+        return
+    meta.pop("attempt_token_hash", None)
+    meta["attempt_fence_invalidated_at"] = invalidated_at
+
+
+def _validate_agent_attempt(job_id: str, meta: dict, extra: dict) -> None:
+    provided_token = extra.pop("attempt_token", None)
+    provided_attempt = extra.get("attempt_number")
+    if meta.get("attempt_fencing_enabled") is not True:
+        return
+
+    expected_hash = meta.get("attempt_token_hash")
+    expected_attempt = int(meta.get("attempt_number", 0) or 0)
+    expected_worker = str(meta.get("target_host") or "").strip()
+    provided_worker = str(extra.get("worker_id") or "").strip()
+    valid_token = (
+        isinstance(expected_hash, str)
+        and bool(expected_hash)
+        and isinstance(provided_token, str)
+        and bool(provided_token)
+        and hmac.compare_digest(expected_hash, _attempt_token_digest(provided_token))
+    )
+    valid_attempt = isinstance(provided_attempt, int) and not isinstance(provided_attempt, bool) and (
+        provided_attempt == expected_attempt
+    )
+    valid_worker = bool(expected_worker) and provided_worker == expected_worker
+    if valid_token and valid_attempt and valid_worker:
+        return
+
+    _LOGGER.warning(
+        "Rejected stale or unfenced status update for job %s from worker %s (attempt=%r current_attempt=%d)",
+        job_id,
+        provided_worker or "unknown",
+        provided_attempt,
+        expected_attempt,
+    )
+    raise HTTPException(
+        409,
+        {
+            "code": "stale_job_attempt",
+            "message": "Status update does not belong to the current dispatched attempt",
+        },
+    )
+
+
 
 def _write_status(job_id: str, status: str, extra: dict | None = None):
     """Persist status to disk and update the in-memory jobs cache."""
@@ -1300,6 +1413,8 @@ def _write_status(job_id: str, status: str, extra: dict | None = None):
         sorted((extra or {}).keys()),
     )
     status_ts = time.time()
+    if status == JobStatus.QUEUED.value and prev != JobStatus.QUEUED.value:
+        _invalidate_attempt_fence(job_id, status_ts)
     extra_payload = dict(extra or {})
     for key in EMAIL_NOTIFICATION_METADATA_KEYS:
         if key not in extra_payload and key in previous_payload:
@@ -1328,6 +1443,8 @@ def _force_status(job_id: str, status: str, extra: dict | None = None) -> None:
     previous_payload = _read_status_payload(job_id) or {}
     prev = previous_payload.get("status") or _read_status_file(job_id)
     status_ts = time.time()
+    if status == JobStatus.QUEUED.value and prev != JobStatus.QUEUED.value:
+        _invalidate_attempt_fence(job_id, status_ts)
     extra_payload = dict(extra or {})
     for key in EMAIL_NOTIFICATION_METADATA_KEYS:
         if key not in extra_payload and key in previous_payload:
@@ -1691,15 +1808,32 @@ def _can_dispatch_to_worker(
     queue_payload: dict,
     *,
     deucalion_active_counts: dict[str, int] | None = None,
+    supports_attempt_fencing: bool = False,
 ) -> bool:
-    if worker_id == "deucalion":
-        return _can_dispatch_to_deucalion(queue_payload, deucalion_active_counts)
-
     job_id = queue_payload.get("job_id")
     if not isinstance(job_id, str) or not job_id:
         return True
 
     meta = jobs.get(job_id) or {}
+    if meta.get("attempt_fencing_enabled") is True and not supports_attempt_fencing:
+        _LOGGER.info(
+            "Legacy worker %s cannot accept fenced job %s; keeping it queued",
+            worker_id,
+            job_id,
+        )
+        return False
+    if worker_id == "deucalion":
+        return _can_dispatch_to_deucalion(queue_payload, deucalion_active_counts)
+
+    recovery_host = _pending_persistent_worker_recovery_host(job_id, meta)
+    if recovery_host and worker_id != recovery_host:
+        _LOGGER.info(
+            "Worker %s cannot accept job %s while persistent recovery belongs to %s",
+            worker_id,
+            job_id,
+            recovery_host,
+        )
+        return False
     target_worker_profile = _normalize_target_worker_profile(
         queue_payload.get("target_worker_profile") or meta.get("target_worker_profile")
     )
@@ -2163,6 +2297,40 @@ def _worker_heartbeat_cutoff(host: str) -> int:
     return int(settings.HOST_HEARTBEAT_TTL) + _worker_stale_grace_seconds(host)
 
 
+def _pending_persistent_worker_recovery_host(job_id: str, meta: dict) -> str | None:
+    recoverable_hosts = {
+        str(item).strip()
+        for item in getattr(settings, "PERSISTENT_RECOVERY_WORKER_HOSTS", [])
+        if str(item).strip()
+    }
+    state_path = Path(settings.JOBS_DIR) / job_id / ".worker" / "union.json"
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(state, dict) or not state.get("run_name"):
+        return None
+
+    host = str(
+        state.get("worker_id")
+        or meta.get("target_host")
+        or meta.get("preferred_host")
+        or "union-inesctec"
+    ).strip()
+    if host not in recoverable_hosts:
+        return None
+
+    # A non-terminal execution must be reattached by its worker. A terminal
+    # execution remains recoverable until its final status is acknowledged.
+    if state.get("terminal") is not True or state.get("orchestrator_ack") is not True:
+        return host
+    return None
+
+
+def _has_pending_persistent_worker_recovery(job_id: str, meta: dict) -> bool:
+    return _pending_persistent_worker_recovery_host(job_id, meta) is not None
+
+
 def _should_preserve_heartbeat_active_status(job_id: str, meta: dict, now_ts: float) -> bool:
     host = str(meta.get("target_host") or meta.get("preferred_host") or "")
     if not host:
@@ -2526,87 +2694,107 @@ def _simulation_data_metadata(job_id: str, result_payload: dict) -> dict:
 def _mark_stale_jobs():
     """Detect jobs stuck on offline workers and requeue or fail them."""
     now = time.time()
-    for job_id, meta in list(jobs.items()):
-        status = meta.get("status")
-        host = meta.get("target_host")
-        if status not in ACTIVE_JOB_STATUSES:
-            continue
+    _refresh_jobs()
+    active_job_ids = [
+        job_id
+        for job_id, meta in jobs.items()
+        if isinstance(meta, dict) and meta.get("status") in ACTIVE_JOB_STATUSES
+    ]
+    for job_id in active_job_ids:
+        with _job_state_lock(job_id):
+            _refresh_jobs()
+            meta = jobs.get(job_id)
+            if isinstance(meta, dict):
+                _mark_stale_job_locked(job_id, meta, now)
 
-        status_ttl = _status_stale_ttl(meta, status)
-        last_update = _status_last_update(job_id)
-        if last_update and (now - last_update) > status_ttl:
-            if _should_preserve_heartbeat_active_status(job_id, meta, now) or _should_preserve_deucalion_active_status(job_id, meta, now):
-                _LOGGER.info(
-                    "Keeping %s job %s while worker heartbeat reports it active",
-                    status,
-                    job_id,
-                )
-            else:
-                preferred = meta.get("preferred_host") or meta.get("target_host")
-                require_host = bool(meta.get("require_host", bool(preferred)))
-                if status in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value):
-                    job_utils.enqueue_job(
-                        _queue_payload(
-                            job_id=job_id,
-                            preferred_host=preferred,
-                            require_host=require_host,
-                            submitted_by=meta.get("submitted_by"),
-                            target_worker_profile=meta.get("target_worker_profile"),
-                        )
-                    )
-                    meta = _reset_runtime_metadata(job_id, meta)
-                    meta["preferred_host"] = preferred
-                    meta["require_host"] = require_host
-                    meta["target_host"] = preferred if require_host else None
-                    jobs[job_id] = meta
-                    _write_status(
-                        job_id,
-                        JobStatus.QUEUED.value,
-                        {"requeued_from": host, "preferred_host": preferred, "stale_status": True},
-                    )
-                    _LOGGER.warning("Re-queued dispatched job %s due to stale status update", job_id)
-                else:
-                    _write_status(job_id, JobStatus.FAILED.value, {"error": "stale_status", "last_host": host})
-                    meta["status"] = JobStatus.FAILED.value
-                    _persist_job(job_id, meta)
-                    _LOGGER.warning("Marked job %s as failed due to stale status update", job_id)
-                continue
 
-        if not host:
-            continue
-        hb = host_heartbeats.get(host)
-        last_seen = hb["last_seen"] if hb else None
-        if last_seen is None:
-            continue  # no heartbeat recorded yet; give it a chance
-        cutoff = _worker_heartbeat_cutoff(str(host))
-        offline = (now - last_seen) > cutoff
-        if not offline:
-            continue
-        preferred = meta.get("preferred_host") or meta.get("target_host")
-        require_host = bool(meta.get("require_host", bool(preferred)))
-        if status in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value):
-            # Put back in queue for another worker to pick up
-            job_utils.enqueue_job(
-                _queue_payload(
-                    job_id=job_id,
-                    preferred_host=preferred,
-                    require_host=require_host,
-                    submitted_by=meta.get("submitted_by"),
-                    target_worker_profile=meta.get("target_worker_profile"),
-                )
+def _mark_stale_job_locked(job_id: str, meta: dict, now: float) -> None:
+    status = _read_status_file(job_id) or meta.get("status")
+    host = meta.get("target_host")
+    if status not in ACTIVE_JOB_STATUSES:
+        return
+    if _has_pending_persistent_worker_recovery(job_id, meta):
+        _LOGGER.info(
+            "Keeping %s job %s for persistent recovery by worker %s",
+            status,
+            job_id,
+            host,
+        )
+        return
+
+    status_ttl = _status_stale_ttl(meta, status)
+    last_update = _status_last_update(job_id)
+    if last_update and (now - last_update) > status_ttl:
+        if _should_preserve_heartbeat_active_status(job_id, meta, now) or _should_preserve_deucalion_active_status(job_id, meta, now):
+            _LOGGER.info(
+                "Keeping %s job %s while worker heartbeat reports it active",
+                status,
+                job_id,
             )
-            meta = _reset_runtime_metadata(job_id, meta)
-            meta["preferred_host"] = preferred
-            meta["require_host"] = require_host
-            meta["target_host"] = preferred if require_host else None
-            jobs[job_id] = meta
-            _write_status(job_id, JobStatus.QUEUED.value, {"requeued_from": host, "preferred_host": preferred})
-            _LOGGER.warning("Re-queued stale dispatched job %s from offline host %s", job_id, host)
-        elif status in (JobStatus.RUNNING.value, JobStatus.STOP_REQUESTED.value):
-            _write_status(job_id, JobStatus.FAILED.value, {"error": "worker_offline", "last_host": host})
-            meta["status"] = JobStatus.FAILED.value
-            _persist_job(job_id, meta)
-            _LOGGER.warning("Marked job %s as failed because host %s is offline", job_id, host)
+        else:
+            preferred = meta.get("preferred_host") or meta.get("target_host")
+            require_host = bool(meta.get("require_host", bool(preferred)))
+            if status in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value):
+                job_utils.enqueue_job(
+                    _queue_payload(
+                        job_id=job_id,
+                        preferred_host=preferred,
+                        require_host=require_host,
+                        submitted_by=meta.get("submitted_by"),
+                        target_worker_profile=meta.get("target_worker_profile"),
+                    )
+                )
+                meta = _reset_runtime_metadata(job_id, meta)
+                meta["preferred_host"] = preferred
+                meta["require_host"] = require_host
+                meta["target_host"] = preferred if require_host else None
+                jobs[job_id] = meta
+                _write_status(
+                    job_id,
+                    JobStatus.QUEUED.value,
+                    {"requeued_from": host, "preferred_host": preferred, "stale_status": True},
+                )
+                _LOGGER.warning("Re-queued dispatched job %s due to stale status update", job_id)
+            else:
+                _write_status(job_id, JobStatus.FAILED.value, {"error": "stale_status", "last_host": host})
+                meta["status"] = JobStatus.FAILED.value
+                _persist_job(job_id, meta)
+                _LOGGER.warning("Marked job %s as failed due to stale status update", job_id)
+            return
+
+    if not host:
+        return
+    hb = host_heartbeats.get(host)
+    last_seen = hb["last_seen"] if hb else None
+    if last_seen is None:
+        return
+    cutoff = _worker_heartbeat_cutoff(str(host))
+    if (now - last_seen) <= cutoff:
+        return
+    preferred = meta.get("preferred_host") or meta.get("target_host")
+    require_host = bool(meta.get("require_host", bool(preferred)))
+    if status in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value):
+        job_utils.enqueue_job(
+            _queue_payload(
+                job_id=job_id,
+                preferred_host=preferred,
+                require_host=require_host,
+                submitted_by=meta.get("submitted_by"),
+                target_worker_profile=meta.get("target_worker_profile"),
+            )
+        )
+        meta = _reset_runtime_metadata(job_id, meta)
+        meta["preferred_host"] = preferred
+        meta["require_host"] = require_host
+        meta["target_host"] = preferred if require_host else None
+        jobs[job_id] = meta
+        _write_status(job_id, JobStatus.QUEUED.value, {"requeued_from": host, "preferred_host": preferred})
+        _LOGGER.warning("Re-queued stale dispatched job %s from offline host %s", job_id, host)
+    elif status in (JobStatus.RUNNING.value, JobStatus.STOP_REQUESTED.value):
+        _write_status(job_id, JobStatus.FAILED.value, {"error": "worker_offline", "last_host": host})
+        meta["status"] = JobStatus.FAILED.value
+        _persist_job(job_id, meta)
+        _LOGGER.warning("Marked job %s as failed because host %s is offline", job_id, host)
 
 
 async def launch_simulation(request: JobLaunchRequest):
@@ -3002,7 +3190,7 @@ def list_jobs():
             "total_duration_seconds": durations.get("total_duration_seconds"),
             "requeue_count": int(merged.get("requeue_count", 0) or 0),
             "attempt_number": int(merged.get("attempt_number", 0) or 0),
-            "job_meta": _without_email_notification_metadata(merged),
+            "job_meta": _public_job_metadata(merged),
         }
         queued_start_estimate = queued_start_estimates.get(job_id)
         if queued_start_estimate:
@@ -3256,6 +3444,19 @@ def ops_requeue_job(
     force: bool = False,
     preferred_host: Optional[str] = None,
     require_host: Optional[bool] = None,
+):
+    _refresh_jobs()
+    if not _job_exists(job_id):
+        raise HTTPException(404, f"Job {job_id} not found")
+    with _job_state_lock(job_id):
+        return _ops_requeue_job_locked(job_id, force, preferred_host, require_host)
+
+
+def _ops_requeue_job_locked(
+    job_id: str,
+    force: bool,
+    preferred_host: Optional[str],
+    require_host: Optional[bool],
 ):
     _refresh_jobs()
     if not _job_exists(job_id):
@@ -3533,14 +3734,20 @@ def ops_cleanup_jobs(keep: list[str] | None = None) -> dict:
     }
 
 # ---------- hooks used by agent endpoints ----------
-def agent_next_job(worker_id: str):
+def agent_next_job(worker_id: str, capabilities: list[str] | None = None):
     with _dispatch_lock(worker_id):
-        return _agent_next_job_locked(worker_id)
+        return _agent_next_job_locked(worker_id, capabilities=capabilities)
 
 
-def _agent_next_job_locked(worker_id: str):
+def _agent_next_job_locked(worker_id: str, capabilities: list[str] | None = None):
     _refresh_jobs()
     _mark_stale_jobs()
+    worker_capabilities = {
+        str(capability).strip()
+        for capability in (capabilities or [])
+        if str(capability).strip()
+    }
+    supports_attempt_fencing = ATTEMPT_FENCING_CAPABILITY in worker_capabilities
     deucalion_active_counts = _deucalion_active_counts_by_profile() if worker_id == "deucalion" else None
     job_queue_entry = job_utils.agent_pop_next_job(
         worker_id,
@@ -3548,6 +3755,7 @@ def _agent_next_job_locked(worker_id: str):
             worker_id,
             payload,
             deucalion_active_counts=deucalion_active_counts,
+            supports_attempt_fencing=supports_attempt_fencing,
         ),
     )
     if not job_queue_entry:
@@ -3555,6 +3763,22 @@ def _agent_next_job_locked(worker_id: str):
         return None
 
     job_id = job_queue_entry["job_id"]
+    with _job_state_lock(job_id):
+        return _dispatch_claimed_job(
+            worker_id,
+            job_queue_entry,
+            supports_attempt_fencing=supports_attempt_fencing,
+        )
+
+
+def _dispatch_claimed_job(
+    worker_id: str,
+    job_queue_entry: dict,
+    *,
+    supports_attempt_fencing: bool,
+):
+    job_id = job_queue_entry["job_id"]
+    _refresh_jobs()
 
     meta = jobs.get(job_id)
     if not meta:
@@ -3591,9 +3815,12 @@ def _agent_next_job_locked(worker_id: str):
     requested_image_tag = _normalize_image_tag(meta.get("image_tag"))
     dispatch_image, dispatch_image_tag = _resolve_job_image_for_worker(worker_id, requested_image_tag)
 
+    next_attempt_number = int(meta.get("attempt_number", 0) or 0) + 1
+    attempt_token = secrets.token_urlsafe(32) if supports_attempt_fencing else None
     response = {
         "job_id": job_id,
         "job_name": job_name,
+        "attempt_number": next_attempt_number,
         "config_path": runtime_config_path,
         "source_config_path": config_path,
         "preferred_host": job_queue_entry.get("preferred_host"),
@@ -3613,6 +3840,9 @@ def _agent_next_job_locked(worker_id: str):
             "OPEVA_JOB_NAME": str(job_name),
         },
     }
+    if attempt_token is not None:
+        response["attempt_token"] = attempt_token
+        response["attempt_protocol"] = ATTEMPT_FENCING_CAPABILITY
     if worker_id == "deucalion":
         deucalion_tracking_uri = str(settings.DEUCALION_MLFLOW_TRACKING_URI or "").strip()
         if deucalion_tracking_uri:
@@ -3633,6 +3863,11 @@ def _agent_next_job_locked(worker_id: str):
     meta["target_host"] = worker_id
     meta["dispatched_image"] = response["image"]
     meta["dispatched_image_tag"] = response["image_tag"]
+    if attempt_token is not None:
+        meta["attempt_fencing_enabled"] = True
+        meta["attempt_protocol"] = ATTEMPT_FENCING_CAPABILITY
+        meta["attempt_token_hash"] = _attempt_token_digest(attempt_token)
+        meta.pop("attempt_fence_invalidated_at", None)
     jobs[job_id] = meta
 
     _write_status(
@@ -3674,13 +3909,23 @@ def _agent_next_job_locked(worker_id: str):
 def agent_update_status(job_id: str, status: str, extra: dict | None = None):
     _refresh_jobs()
     _mark_stale_jobs()
-    extra = extra or {}
+    if not _job_exists(job_id):
+        raise HTTPException(404, f"Job {job_id} not found")
+    with _job_state_lock(job_id):
+        return _agent_update_status_locked(job_id, status, extra)
+
+
+def _agent_update_status_locked(job_id: str, status: str, extra: dict | None = None):
+    _refresh_jobs()
+    extra = dict(extra or {})
     if not _job_exists(job_id):
         raise HTTPException(404, f"Job {job_id} not found")
     try:
         JobStatus(status)
     except ValueError:
         raise HTTPException(400, f"Unknown status '{status}'")
+    meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {})
+    _validate_agent_attempt(job_id, meta, extra)
     _LOGGER.info(
         "Agent reported status for job %s: %s (extra keys=%s)",
         job_id,

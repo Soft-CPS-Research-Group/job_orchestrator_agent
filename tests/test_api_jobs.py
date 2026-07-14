@@ -239,6 +239,59 @@ def test_run_simulation_accepts_custom_image(api_client, monkeypatch):
     assert info["image_tag"] == image_tag
 
 
+def test_agent_api_negotiates_and_enforces_attempt_fencing(api_client, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "AVAILABLE_HOSTS", ["worker-a"])
+    launch = api_client.post(
+        "/run-simulation",
+        json={
+            "config": {"experiment": {"name": "Fencing", "run_name": "API"}},
+            "target_host": "worker-a",
+        },
+    )
+    assert launch.status_code == 200
+    job_id = launch.json()["job_id"]
+
+    dispatched = api_client.post(
+        "/api/agent/next-job",
+        json={"worker_id": "worker-a", "capabilities": ["attempt_fencing_v1"]},
+    )
+    assert dispatched.status_code == 200
+    payload = dispatched.json()
+    assert payload["job_id"] == job_id
+    assert payload["attempt_protocol"] == "attempt_fencing_v1"
+    assert payload["attempt_token"]
+
+    listed_job = next(item for item in api_client.get("/jobs").json() if item["job_id"] == job_id)
+    assert "attempt_token_hash" not in listed_job["job_meta"]
+
+    accepted = api_client.post(
+        "/api/agent/job-status",
+        json={
+            "job_id": job_id,
+            "status": "setup",
+            "worker_id": "worker-a",
+            "attempt_number": payload["attempt_number"],
+            "attempt_token": payload["attempt_token"],
+        },
+    )
+    assert accepted.status_code == 200
+
+    rejected = api_client.post(
+        "/api/agent/job-status",
+        json={
+            "job_id": job_id,
+            "status": "running",
+            "worker_id": "worker-a",
+            "attempt_number": payload["attempt_number"],
+            "attempt_token": "token-from-an-old-attempt",
+        },
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["code"] == "stale_job_attempt"
+
+
 def test_job_resolved_config_endpoint(api_client, monkeypatch):
     from app.config import settings
 

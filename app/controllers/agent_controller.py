@@ -7,7 +7,7 @@ from app.models.agent import NextJobRequest, StatusRequest, HeartbeatRequest
 _LOGGER = logging.getLogger(__name__)
 
 def next_job(req: NextJobRequest):
-    job = job_service.agent_next_job(req.worker_id)
+    job = job_service.agent_next_job(req.worker_id, capabilities=req.capabilities)
     if not job:
         # the endpoint will return 204; controller returns None to signal that
         _LOGGER.debug("Worker %s requested next job but none available", req.worker_id)

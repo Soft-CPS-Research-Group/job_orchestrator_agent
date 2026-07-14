@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -58,12 +59,14 @@ def jobs_env(tmp_path, monkeypatch):
 
     job_service.jobs.clear()
     job_service.host_heartbeats.clear()
+    job_service._progress_eta_cache.clear()
     monkeypatch.setattr(job_service, "_validate_deucalion_sif_tag_available", lambda _tag: None)
 
     try:
         yield SimpleNamespace(base=base, configs=configs, jobs=jobs_dir, queue=queue)
     finally:
         job_service.jobs.clear()
+        job_service._progress_eta_cache.clear()
         job_track.write_text("{}")
         for key, value in original.items():
             if key == "AVAILABLE_HOSTS":
@@ -668,6 +671,70 @@ def test_get_progress_adds_eta_from_step_totals(monkeypatch):
     assert payload["eta"]["current"] == 50
     assert payload["eta"]["total"] == 100
     assert payload["eta_seconds"] == pytest.approx(100.0)
+
+
+def test_get_progress_recalculates_eta_only_when_progress_changes(monkeypatch):
+    job_id = "job-progress-eta-cache"
+    current_time = [1_000.0]
+    monkeypatch.setattr(job_service.time, "time", lambda: current_time[0])
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.RUNNING.value,
+        "started_at": 900.0,
+        "attempt_number": 1,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(job_id, JobStatus.RUNNING.value, {})
+    progress_path = progress_dir / "progress.json"
+    progress_path.write_text(json.dumps({"step_current": 25, "step_total": 100}))
+
+    first = job_service.get_progress(job_id)
+    current_time[0] = 1_100.0
+    unchanged = job_service.get_progress(job_id)
+
+    assert unchanged["eta"] == first["eta"]
+
+    progress_path.write_text(json.dumps({"step_current": 50, "step_total": 100}))
+    changed = job_service.get_progress(job_id)
+
+    assert changed["eta"]["progress_percent"] == 50.0
+    assert changed["eta"]["elapsed_seconds"] == pytest.approx(200.0)
+    assert changed["eta"]["eta_seconds"] == pytest.approx(200.0)
+    assert changed["eta"]["eta_seconds"] != first["eta"]["eta_seconds"]
+
+
+def test_get_progress_caches_unavailable_eta_until_progress_changes(monkeypatch):
+    job_id = "job-progress-eta-unavailable-cache"
+    monkeypatch.setattr(job_service.time, "time", lambda: 1_000.0)
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "status": JobStatus.RUNNING.value,
+        "started_at": 900.0,
+        "attempt_number": 1,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    progress_dir = job_dir / "progress"
+    progress_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(job_id, JobStatus.RUNNING.value, {})
+    (progress_dir / "progress.json").write_text("{}")
+    config_reads = []
+
+    def load_config(_job_id, _tracked):
+        config_reads.append(True)
+        return {}
+
+    monkeypatch.setattr(job_service, "_load_eta_config", load_config)
+
+    first = job_service.get_progress(job_id)
+    second = job_service.get_progress(job_id)
+
+    assert first["eta"]["reason"] == "progress_unavailable"
+    assert second["eta"] == first["eta"]
+    assert len(config_reads) == 1
 
 
 def test_get_progress_prefers_step_totals_over_fraction_like_progress_pct(monkeypatch):
@@ -1357,6 +1424,238 @@ def test_any_gpu_job_skips_cpu_worker_even_without_gpu_config():
     assert dispatched["job_id"] == job_id
     assert dispatched["target_worker_profile"] == "gpu"
     assert not queue_file.exists()
+
+
+def test_any_gpu_job_can_be_dispatched_to_union_worker():
+    settings.AVAILABLE_HOSTS = ["server", "union-inesctec"]
+    job_service.record_host_heartbeat("server", {"executor": "docker", "gpu_enabled": False})
+    job_service.record_host_heartbeat(
+        "union-inesctec",
+        {
+            "executor": "union",
+            "gpu_enabled": True,
+            "gpu_required": True,
+            "max_active_jobs": 1,
+        },
+    )
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Union", "run_name": "AutomaticGpu"}},
+                target_worker_profile="gpu",
+            )
+        )
+    )
+    job_id = result["job_id"]
+
+    assert job_service.agent_next_job("server") is None
+    dispatched = job_service.agent_next_job("union-inesctec")
+
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
+    assert dispatched["target_worker_profile"] == "gpu"
+    assert dispatched["image"].startswith(f"{settings.JOB_IMAGE_REPOSITORY}:")
+
+
+def test_dispatch_sends_next_attempt_number_to_worker():
+    settings.AVAILABLE_HOSTS = ["union-inesctec"]
+    job_service.record_host_heartbeat(
+        "union-inesctec",
+        {"executor": "union", "gpu_enabled": True, "gpu_required": True},
+    )
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Union", "run_name": "Retry"}},
+                target_host="union-inesctec",
+            )
+        )
+    )
+    job_id = result["job_id"]
+    job_service.jobs[job_id]["attempt_number"] = 1
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+
+    dispatched = job_service.agent_next_job("union-inesctec")
+
+    assert dispatched is not None
+    assert dispatched["attempt_number"] == 2
+    assert job_service.jobs[job_id]["attempt_number"] == 2
+
+
+def test_attempt_fencing_rejects_late_updates_after_requeue_and_redispatch():
+    settings.AVAILABLE_HOSTS = ["worker-a", "worker-b"]
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Fencing", "run_name": "LateUpdate"}},
+                target_host="worker-a",
+            )
+        )
+    )
+    job_id = result["job_id"]
+    capability = [job_service.ATTEMPT_FENCING_CAPABILITY]
+
+    first = job_service.agent_next_job("worker-a", capabilities=capability)
+
+    assert first is not None
+    assert first["attempt_protocol"] == job_service.ATTEMPT_FENCING_CAPABILITY
+    assert isinstance(first["attempt_token"], str)
+    assert len(first["attempt_token"]) >= 32
+    assert job_service.jobs[job_id]["attempt_token_hash"] == job_service._attempt_token_digest(first["attempt_token"])
+    assert first["attempt_token"] not in Path(settings.JOB_TRACK_FILE).read_text()
+
+    accepted = job_service.agent_update_status(
+        job_id,
+        JobStatus.SETUP.value,
+        {
+            "worker_id": "worker-a",
+            "attempt_number": first["attempt_number"],
+            "attempt_token": first["attempt_token"],
+        },
+    )
+    assert accepted["ok"] is True
+    assert first["attempt_token"] not in (Path(settings.JOBS_DIR) / job_id / "status.json").read_text()
+
+    job_service.ops_requeue_job(job_id, force=True, preferred_host="worker-b", require_host=True)
+
+    assert "attempt_token_hash" not in job_service.jobs[job_id]
+    with pytest.raises(HTTPException) as stale_while_queued:
+        job_service.agent_update_status(
+            job_id,
+            JobStatus.RUNNING.value,
+            {
+                "worker_id": "worker-a",
+                "attempt_number": first["attempt_number"],
+                "attempt_token": first["attempt_token"],
+            },
+        )
+    assert stale_while_queued.value.status_code == 409
+    assert stale_while_queued.value.detail["code"] == "stale_job_attempt"
+    assert job_service.get_status(job_id)["status"] == JobStatus.QUEUED.value
+
+    assert job_service.agent_next_job("worker-b") is None
+    second = job_service.agent_next_job("worker-b", capabilities=capability)
+
+    assert second is not None
+    assert second["attempt_number"] == first["attempt_number"] + 1
+    assert second["attempt_token"] != first["attempt_token"]
+    with pytest.raises(HTTPException) as stale_after_redispatch:
+        job_service.agent_update_status(
+            job_id,
+            JobStatus.FINISHED.value,
+            {
+                "worker_id": "worker-a",
+                "attempt_number": first["attempt_number"],
+                "attempt_token": first["attempt_token"],
+            },
+        )
+    assert stale_after_redispatch.value.status_code == 409
+    assert job_service.get_status(job_id)["status"] == JobStatus.DISPATCHED.value
+
+    accepted = job_service.agent_update_status(
+        job_id,
+        JobStatus.SETUP.value,
+        {
+            "worker_id": "worker-b",
+            "attempt_number": second["attempt_number"],
+            "attempt_token": second["attempt_token"],
+        },
+    )
+    assert accepted["ok"] is True
+    assert job_service.get_status(job_id)["status"] == JobStatus.SETUP.value
+
+
+def test_attempt_fencing_rejects_missing_token_and_wrong_worker():
+    job_id = "job-attempt-fence-validation"
+    token = "current-attempt-secret"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "status": JobStatus.DISPATCHED.value,
+        "attempt_number": 3,
+        "attempt_fencing_enabled": True,
+        "attempt_token_hash": job_service._attempt_token_digest(token),
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(job_id, JobStatus.DISPATCHED.value, {})
+
+    invalid_payloads = (
+        {"worker_id": "worker-a", "attempt_number": 3},
+        {"worker_id": "worker-a", "attempt_number": 2, "attempt_token": token},
+        {"worker_id": "worker-b", "attempt_number": 3, "attempt_token": token},
+    )
+    for payload in invalid_payloads:
+        with pytest.raises(HTTPException) as exc:
+            job_service.agent_update_status(job_id, JobStatus.SETUP.value, payload)
+        assert exc.value.status_code == 409
+
+    assert job_service.get_status(job_id)["status"] == JobStatus.DISPATCHED.value
+
+
+def test_attempt_validation_and_requeue_are_atomic(monkeypatch):
+    job_id = "job-attempt-fence-atomic"
+    token = "atomic-attempt-secret"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "worker-a",
+        "preferred_host": "worker-a",
+        "require_host": True,
+        "status": JobStatus.DISPATCHED.value,
+        "attempt_number": 1,
+        "attempt_fencing_enabled": True,
+        "attempt_token_hash": job_service._attempt_token_digest(token),
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    job_utils.write_status_file(job_id, JobStatus.DISPATCHED.value, {})
+    validation_entered = threading.Event()
+    release_validation = threading.Event()
+    original_validate = job_service._validate_agent_attempt
+    failures: list[Exception] = []
+
+    def blocking_validate(current_job_id, meta, extra):
+        original_validate(current_job_id, meta, extra)
+        validation_entered.set()
+        assert release_validation.wait(timeout=2)
+
+    monkeypatch.setattr(job_service, "_validate_agent_attempt", blocking_validate)
+
+    def update_status():
+        try:
+            job_service.agent_update_status(
+                job_id,
+                JobStatus.SETUP.value,
+                {"worker_id": "worker-a", "attempt_number": 1, "attempt_token": token},
+            )
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    def requeue():
+        try:
+            job_service.ops_requeue_job(job_id, force=True)
+        except Exception as exc:  # pragma: no cover - asserted below
+            failures.append(exc)
+
+    status_thread = threading.Thread(target=update_status)
+    requeue_thread = threading.Thread(target=requeue)
+    status_thread.start()
+    assert validation_entered.wait(timeout=2)
+    requeue_thread.start()
+    time.sleep(0.05)
+    assert requeue_thread.is_alive()
+    release_validation.set()
+    status_thread.join(timeout=2)
+    requeue_thread.join(timeout=2)
+
+    assert failures == []
+    assert not status_thread.is_alive()
+    assert not requeue_thread.is_alive()
+    assert job_service.get_status(job_id)["status"] == JobStatus.QUEUED.value
+    assert "attempt_token_hash" not in job_service.jobs[job_id]
 
 
 def test_any_cpu_job_skips_gpu_worker():
@@ -2227,6 +2526,153 @@ def test_mark_stale_remote_running_fails_after_remote_grace(monkeypatch):
     assert status_data["error"] == "stale_status"
     track = json.loads(Path(settings.JOB_TRACK_FILE).read_text())
     assert track[job_id]["status"] == JobStatus.FAILED.value
+
+
+@pytest.mark.parametrize(
+    ("terminal", "orchestrator_ack"),
+    [
+        (False, False),
+        (True, False),
+    ],
+)
+def test_mark_stale_union_job_preserves_pending_persistent_recovery(
+    monkeypatch,
+    terminal,
+    orchestrator_ack,
+):
+    settings.AVAILABLE_HOSTS = ["union-inesctec"]
+    monkeypatch.setattr(settings, "PERSISTENT_RECOVERY_WORKER_HOSTS", ["union-inesctec"])
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+    monkeypatch.setattr(settings, "HOST_HEARTBEAT_TTL", 1)
+    monkeypatch.setattr(settings, "REMOTE_WORKER_HOSTS", ["union-inesctec"])
+    monkeypatch.setattr(settings, "REMOTE_WORKER_STALE_GRACE_SECONDS", 1)
+
+    job_id = f"job-union-recovery-{int(terminal)}"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "union-inesctec",
+        "preferred_host": "union-inesctec",
+        "require_host": True,
+        "status": JobStatus.RUNNING.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    (job_dir / ".worker").mkdir(parents=True)
+    (job_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "status": JobStatus.RUNNING.value,
+                "status_updated_at": time.time() - 120,
+            }
+        )
+    )
+    (job_dir / ".worker" / "union.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "run_name": f"opeva-{job_id}-a1",
+                "terminal": terminal,
+                "orchestrator_ack": orchestrator_ack,
+            }
+        )
+    )
+    job_service.host_heartbeats["union-inesctec"] = {
+        "last_seen": time.time() - 120,
+        "info": {},
+    }
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.RUNNING.value
+    assert not (Path(settings.QUEUE_DIR) / f"{job_id}.json").exists()
+
+
+def test_mark_stale_union_job_does_not_preserve_acknowledged_terminal_state(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["union-inesctec"]
+    monkeypatch.setattr(settings, "PERSISTENT_RECOVERY_WORKER_HOSTS", ["union-inesctec"])
+    monkeypatch.setattr(settings, "JOB_STATUS_TTL", 1)
+
+    job_id = "job-union-recovery-acknowledged"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "union-inesctec",
+        "status": JobStatus.RUNNING.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    (job_dir / ".worker").mkdir(parents=True)
+    (job_dir / "status.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "status": JobStatus.RUNNING.value,
+                "status_updated_at": time.time() - 120,
+            }
+        )
+    )
+    (job_dir / ".worker" / "union.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "run_name": f"opeva-{job_id}-a1",
+                "terminal": True,
+                "orchestrator_ack": True,
+            }
+        )
+    )
+
+    job_service._mark_stale_jobs()
+
+    status_data = json.loads((job_dir / "status.json").read_text())
+    assert status_data["status"] == JobStatus.FAILED.value
+
+
+def test_queued_union_recovery_cannot_be_claimed_by_another_gpu_worker(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["union-inesctec", "gpu-worker"]
+    monkeypatch.setattr(settings, "PERSISTENT_RECOVERY_WORKER_HOSTS", ["union-inesctec"])
+    job_service.record_host_heartbeat("union-inesctec", {"gpu_enabled": True, "executor": "union"})
+    job_service.record_host_heartbeat("gpu-worker", {"gpu_enabled": True, "executor": "docker"})
+
+    job_id = "job-union-recovery-queued"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "job_name": "recover-queued",
+        "config_path": "configs/recover.yaml",
+        "target_worker_profile": "gpu",
+        "status": JobStatus.QUEUED.value,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    (job_dir / ".worker").mkdir(parents=True)
+    (job_dir / "status.json").write_text(
+        json.dumps({"job_id": job_id, "status": JobStatus.QUEUED.value, "status_updated_at": time.time()})
+    )
+    (job_dir / ".worker" / "union.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "worker_id": "union-inesctec",
+                "run_name": f"opeva-{job_id}-a1",
+                "terminal": False,
+                "orchestrator_ack": False,
+            }
+        )
+    )
+    job_utils.enqueue_job(
+        {
+            "job_id": job_id,
+            "target_worker_profile": "gpu",
+            "require_host": False,
+        }
+    )
+
+    assert job_service.agent_next_job("gpu-worker") is None
+    dispatched = job_service.agent_next_job("union-inesctec")
+
+    assert dispatched is not None
+    assert dispatched["job_id"] == job_id
 
 
 def test_mark_stale_deucalion_dispatched_pending_is_preserved(monkeypatch):

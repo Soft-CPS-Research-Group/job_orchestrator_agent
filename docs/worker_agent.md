@@ -13,7 +13,8 @@ are documented in `docs/jobs.md`.
   - optional `target_worker_profile`: `"cpu"` or `"gpu"` when automatic host
     selection was constrained to a compute profile.
 - Agents obtain work by POSTing to `/api/agent/next-job` with their
-  `worker_id`. The server returns the first job whose host requirement is
+  `worker_id` and supported `capabilities`. Workers implementing attempt
+  fencing advertise `"attempt_fencing_v1"`. The server returns the first job whose host requirement is
   satisfied (matching host for required jobs, or any eligible host for
   automatic jobs).
 - Automatic GPU jobs are only dispatched to workers whose heartbeat advertises
@@ -21,9 +22,26 @@ are documented in `docs/jobs.md`.
   GPU flag such as `has_gpu`/`cuda_available`) when they can run CUDA/GPU jobs.
 - Special case: worker `deucalion` is strict and only receives jobs explicitly
   pinned to `target_host="deucalion"` (host required).
+- Worker `union-inesctec` advertises itself as GPU-only. It can be selected
+  explicitly with `target_host="union-inesctec"` or automatically with
+  `target_worker_profile="gpu"`.
+- Workers listed in `PERSISTENT_RECOVERY_WORKER_HOSTS` may persist a durable
+  `.worker/union.json` state. While that state is non-terminal, or its terminal
+  outcome is not yet acknowledged, stale reconciliation preserves the job for
+  the same worker instead of placing it back in the queue.
 - The response to `/api/agent/next-job` includes the fully populated payload
   (image, command, volumes, env, job name) derived from orchestrator metadata, so
   agents do not need to read anything from the queue file beyond the job id.
+- For capable workers, the dispatch response also contains `attempt_number`,
+  `attempt_protocol="attempt_fencing_v1"` and an opaque `attempt_token`. Every
+  subsequent `/api/agent/job-status` publication for that execution must echo
+  the same number and token. Requeue invalidates the token immediately; stale
+  updates then receive HTTP 409 and cannot mutate the new attempt. Current
+  workers respond by stopping the superseded Docker container, Slurm job or
+  Union Run. The raw token is never persisted by the orchestrator.
+- Capability negotiation permits rolling upgrades. Legacy jobs remain
+  compatible with legacy workers. Once a job has used attempt fencing, it stays
+  fenced and is no longer eligible for dispatch to a legacy worker.
 - Once dispatched, the orchestrator marks the job as `dispatched` and updates
   `target_host` in `job_info.json` and the job registry. Agents are expected to
   begin execution immediately; should they choose not to run the job they
@@ -32,7 +50,8 @@ are documented in `docs/jobs.md`.
 
 ## Lifecycle Hooks
 - **Start:** POST `/api/agent/job-status` with `status="running"` (include
-  `worker_id`, `worker_version`, `container_id`, `container_name`).
+  `worker_id`, `worker_version`, `container_id`, `container_name`, and the
+  dispatch attempt fields when supplied).
 - **Progress heartbeat:** while running, POST periodic `status="running"`
   updates to refresh `status_updated_at` and avoid stale-job handling.
 - **Completion:** POST `/api/agent/job-status` with

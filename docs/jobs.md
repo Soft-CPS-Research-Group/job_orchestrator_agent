@@ -128,6 +128,9 @@ Repeated updates with the same status are accepted (idempotent).
     require a GPU-capable worker even if the config has no GPU marker.
   - Special case: `worker_id="deucalion"` only receives jobs explicitly
     targeted to `deucalion` (`target_host` required).
+  - `worker_id="union-inesctec"` is GPU-only. Select it explicitly with
+    `target_host="union-inesctec"`, or allow automatic GPU routing with
+    `target_worker_profile="gpu"`.
 
 - `POST /api/agent/job-status`
   - Body (example):
