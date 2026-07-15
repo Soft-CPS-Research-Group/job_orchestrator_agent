@@ -1710,7 +1710,7 @@ def _job_requires_gpu(job_id: str, meta: dict | None = None) -> bool:
 
 
 def _worker_supports_gpu(worker_id: str) -> bool:
-    if worker_id == "deucalion":
+    if worker_id == "deucalion" or _is_jetson_worker(worker_id) or _is_union_worker(worker_id):
         return True
     hb = host_heartbeats.get(worker_id)
     info = hb.get("info") if isinstance(hb, dict) else None
@@ -1747,6 +1747,9 @@ def _deucalion_job_profile(job_id: str, meta: dict | None = None) -> str:
         info.get("details"),
         status_payload.get("details"),
     ]
+    target_profile = _normalize_target_worker_profile(metadata.get("target_worker_profile"))
+    if target_profile:
+        return target_profile
     return "gpu" if any(_payload_indicates_gpu(candidate) for candidate in candidates) else "cpu"
 
 
@@ -1844,9 +1847,6 @@ def _can_dispatch_to_worker(
             job_id,
         )
         return False
-    if worker_id == "deucalion":
-        return _can_dispatch_to_deucalion(queue_payload, deucalion_active_counts)
-
     recovery_host = _pending_persistent_worker_recovery_host(job_id, meta)
     if recovery_host and worker_id != recovery_host:
         _LOGGER.info(
@@ -1862,16 +1862,30 @@ def _can_dispatch_to_worker(
     if target_worker_profile == "gpu" and not _worker_supports_gpu(worker_id):
         _LOGGER.info("Worker %s does not advertise GPU support; keeping GPU-targeted job %s queued", worker_id, job_id)
         return False
-    if target_worker_profile == "cpu" and _worker_supports_gpu(worker_id):
+    if target_worker_profile == "cpu" and _worker_supports_gpu(worker_id) and worker_id != "deucalion":
         _LOGGER.info("Worker %s advertises GPU support; keeping CPU-targeted job %s queued", worker_id, job_id)
         return False
     if _job_requires_gpu(job_id, meta) and not _worker_supports_gpu(worker_id):
         _LOGGER.info("Worker %s does not advertise GPU support; keeping GPU job %s queued", worker_id, job_id)
         return False
+    if worker_id == "deucalion":
+        try:
+            _validate_deucalion_sif_tag_available(_normalize_image_tag(meta.get("image_tag")))
+        except HTTPException as exc:
+            _LOGGER.info("Deucalion cannot accept job %s: %s", job_id, exc.detail)
+            return False
+        return _can_dispatch_to_deucalion(queue_payload, deucalion_active_counts)
     if _is_jetson_worker(worker_id):
         try:
             image_tag = _normalize_image_tag(meta.get("image_tag"))
             _validate_jetson_image_tag_available(image_tag)
+        except HTTPException as exc:
+            _LOGGER.info("Worker %s cannot accept job %s: %s", worker_id, job_id, exc.detail)
+            return False
+    if _is_union_worker(worker_id):
+        try:
+            image_tag = _normalize_image_tag(meta.get("image_tag"))
+            _validate_union_image_tag_available(image_tag)
         except HTTPException as exc:
             _LOGGER.info("Worker %s cannot accept job %s: %s", worker_id, job_id, exc.detail)
             return False
@@ -1944,9 +1958,27 @@ def _jetson_image_tag(image_tag: str) -> str:
     return tag
 
 
+def _union_worker_hosts() -> set[str]:
+    return {str(host).strip() for host in (settings.UNION_WORKER_HOSTS or []) if str(host).strip()}
+
+
+def _is_union_worker(worker_id: str | None) -> bool:
+    return str(worker_id or "").strip() in _union_worker_hosts()
+
+
+def _union_image_tag(image_tag: str) -> str:
+    tag = _normalize_image_tag(image_tag)
+    suffix = str(settings.UNION_IMAGE_TAG_SUFFIX or "").strip()
+    if suffix and not tag.endswith(suffix):
+        return f"{tag}{suffix}"
+    return tag
+
+
 def _effective_image_tag_for_worker(worker_id: str, image_tag: str) -> str:
     if _is_jetson_worker(worker_id):
         return _jetson_image_tag(image_tag)
+    if _is_union_worker(worker_id):
+        return _union_image_tag(image_tag)
     return _normalize_image_tag(image_tag)
 
 
@@ -2229,6 +2261,20 @@ def _validate_jetson_image_tag_available(image_tag: str) -> None:
         )
 
 
+def _validate_union_image_tag_available(image_tag: str) -> None:
+    repo = _normalize_image_repository(settings.JOB_IMAGE_REPOSITORY)
+    union_tag = _union_image_tag(image_tag)
+    tag_payload, _cached, _fetched_at = _fetch_dockerhub_tag(repo, union_tag)
+    if tag_payload is None:
+        raise HTTPException(
+            400,
+            (
+                f"Image tag '{image_tag}' is not Union-ready: "
+                f"Docker image '{repo}:{union_tag}' was not found"
+            ),
+        )
+
+
 def list_job_image_versions(repository: Optional[str] = None, limit: Optional[int] = None) -> dict:
     repo = _normalize_image_repository(repository)
     sif_repo = _normalize_image_repository(settings.JOB_SIF_REPOSITORY)
@@ -2249,21 +2295,35 @@ def list_job_image_versions(repository: Optional[str] = None, limit: Optional[in
     }
 
     tags_with_readiness: list[dict] = []
+    variant_suffixes = {
+        str(settings.JETSON_IMAGE_TAG_SUFFIX or ""),
+        str(settings.UNION_IMAGE_TAG_SUFFIX or ""),
+    } - {""}
     for tag in image_tags:
         if not isinstance(tag, dict):
             continue
         tag_name = tag.get("name")
         if not isinstance(tag_name, str):
             continue
+        if (
+            tag_name == "latest"
+            or tag_name.startswith("buildcache")
+            or re.fullmatch(r"sha-[0-9a-f]{7,40}", tag_name)
+        ):
+            continue
+        if any(tag_name.endswith(suffix) for suffix in variant_suffixes):
+            continue
         merged = dict(tag)
         merged["deucalion_ready"] = tag_name in sif_tag_names
         merged["jetson_ready"] = _jetson_image_tag(tag_name) in image_tag_names
+        merged["union_ready"] = _union_image_tag(tag_name) in image_tag_names
         tags_with_readiness.append(merged)
 
     return {
         "repository": repo,
         "sif_repository": sif_repo,
         "jetson_tag_suffix": str(settings.JETSON_IMAGE_TAG_SUFFIX or ""),
+        "union_tag_suffix": str(settings.UNION_IMAGE_TAG_SUFFIX or ""),
         "tags": tags_with_readiness,
         "count": len(tags_with_readiness),
         "cached": bool(image_cached and sif_cached),
@@ -2856,6 +2916,8 @@ async def launch_simulation(request: JobLaunchRequest):
     runtime_config, runtime_config_changed = _resolve_runtime_config(config)
     if target_worker_profile == "cpu" and _config_requires_gpu(runtime_config):
         raise HTTPException(400, "Config requires GPU; choose Any GPU or a GPU-capable host")
+    if preferred_host and _config_requires_gpu(runtime_config) and not _worker_supports_gpu(preferred_host):
+        raise HTTPException(400, f"Config requires GPU, but host '{preferred_host}' is not GPU-capable")
 
     experiment_name, run_name = _resolve_experiment_identity(runtime_config)
     requested_job_name = (request.job_name or "").strip()
@@ -2875,6 +2937,8 @@ async def launch_simulation(request: JobLaunchRequest):
         _validate_deucalion_sif_tag_available(image_tag)
     if _is_jetson_worker(preferred_host):
         _validate_jetson_image_tag_available(image_tag)
+    if _is_union_worker(preferred_host):
+        _validate_union_image_tag_available(image_tag)
 
     if not config_path.startswith("configs/"):
         config_path = f"configs/{config_path}"
@@ -3497,6 +3561,8 @@ def _ops_requeue_job_locked(
         require_host = bool(meta.get("require_host", bool(preferred)))
     if require_host and _is_jetson_worker(preferred):
         _validate_jetson_image_tag_available(_normalize_image_tag(meta.get("image_tag")))
+    if require_host and _is_union_worker(preferred):
+        _validate_union_image_tag_available(_normalize_image_tag(meta.get("image_tag")))
 
     if not force:
         if status_now == JobStatus.FINISHED.value:

@@ -260,7 +260,8 @@ def agent_pop_next_job(worker_id: str, can_accept: Callable[[dict], bool] | None
             preferred = payload.get("preferred_host")
             require_host = payload.get("require_host", bool(preferred))
 
-            # Deucalion is strict: it only accepts jobs explicitly pinned to itself.
+            # Deucalion requires an explicit target because its Slurm options,
+            # account and budget are selected as part of that host-specific flow.
             if worker_id == "deucalion":
                 if preferred != worker_id or not require_host:
                     os.replace(claim_path, path)

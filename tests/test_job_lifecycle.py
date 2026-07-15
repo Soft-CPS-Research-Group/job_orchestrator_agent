@@ -38,6 +38,8 @@ def jobs_env(tmp_path, monkeypatch):
         "AVAILABLE_HOSTS": list(settings.AVAILABLE_HOSTS),
         "JETSON_WORKER_HOSTS": list(settings.JETSON_WORKER_HOSTS),
         "JETSON_IMAGE_TAG_SUFFIX": settings.JETSON_IMAGE_TAG_SUFFIX,
+        "UNION_WORKER_HOSTS": list(settings.UNION_WORKER_HOSTS),
+        "UNION_IMAGE_TAG_SUFFIX": settings.UNION_IMAGE_TAG_SUFFIX,
         "MLFLOW_TRACKING_URI": settings.MLFLOW_TRACKING_URI,
         "DEUCALION_MLFLOW_TRACKING_URI": settings.DEUCALION_MLFLOW_TRACKING_URI,
         "MLFLOW_UI_BASE_URL": settings.MLFLOW_UI_BASE_URL,
@@ -1312,6 +1314,65 @@ def test_launch_to_jetson_rejects_missing_image_variant(monkeypatch):
     assert not list(Path(settings.QUEUE_DIR).glob("*.json"))
 
 
+def test_launch_to_union_dispatches_blackwell_image_variant(monkeypatch):
+    settings.AVAILABLE_HOSTS = ["union-inesctec"]
+    settings.UNION_WORKER_HOSTS = ["union-inesctec"]
+    settings.UNION_IMAGE_TAG_SUFFIX = "-union-blackwell"
+    image_tag = "sha-customv2"
+    union_tag = f"{image_tag}-union-blackwell"
+    expected_image = f"{settings.JOB_IMAGE_REPOSITORY}:{union_tag}"
+    checked_tags = []
+
+    def _fake_fetch_tag(repository: str, tag: str):
+        checked_tags.append((repository, tag))
+        return ({"name": tag}, False, 123.0) if tag == union_tag else (None, False, 123.0)
+
+    monkeypatch.setattr(job_service, "_fetch_dockerhub_tag", _fake_fetch_tag)
+
+    result = asyncio.run(
+        job_service.launch_simulation(
+            JobLaunchRequest(
+                config={"experiment": {"name": "Image", "run_name": "Union"}},
+                target_host="union-inesctec",
+                image_tag=image_tag,
+            )
+        )
+    )
+
+    dispatched = job_service.agent_next_job("union-inesctec")
+    assert dispatched is not None
+    assert dispatched["job_id"] == result["job_id"]
+    assert dispatched["image"] == expected_image
+    assert dispatched["image_tag"] == union_tag
+    assert dispatched["requested_image_tag"] == image_tag
+    assert (settings.JOB_IMAGE_REPOSITORY, union_tag) in checked_tags
+
+
+def test_image_catalog_exposes_only_logical_versions_with_runtime_readiness(monkeypatch):
+    version = "add-union-blackwell-support-a1b2c3d"
+    image_tags = [
+        {"name": "latest"},
+        {"name": "buildcache"},
+        {"name": "sha-deadbee"},
+        {"name": version, "last_updated": "2026-07-15T12:00:00Z"},
+        {"name": f"{version}-jetson-r35.3.1"},
+        {"name": f"{version}-union-blackwell"},
+    ]
+
+    def _fake_tags(repository: str, _limit: int):
+        tags = [{"name": version}] if repository == settings.JOB_SIF_REPOSITORY else image_tags
+        return tags, False, 123.0
+
+    monkeypatch.setattr(job_service, "_fetch_dockerhub_tags", _fake_tags)
+
+    payload = job_service.list_job_image_versions()
+
+    assert [tag["name"] for tag in payload["tags"]] == [version]
+    assert payload["tags"][0]["jetson_ready"] is True
+    assert payload["tags"][0]["deucalion_ready"] is True
+    assert payload["tags"][0]["union_ready"] is True
+
+
 def test_automatic_jetson_skips_missing_image_variant(monkeypatch):
     settings.AVAILABLE_HOSTS = ["jetson-xavier", "worker-a"]
     settings.JETSON_WORKER_HOSTS = ["jetson-xavier"]
@@ -1426,7 +1487,12 @@ def test_any_gpu_job_skips_cpu_worker_even_without_gpu_config():
     assert not queue_file.exists()
 
 
-def test_any_gpu_job_can_be_dispatched_to_union_worker():
+def test_any_gpu_job_can_be_dispatched_to_union_worker(monkeypatch):
+    monkeypatch.setattr(
+        job_service,
+        "_fetch_dockerhub_tag",
+        lambda _repo, tag: ({"name": tag}, False, 123.0),
+    )
     settings.AVAILABLE_HOSTS = ["server", "union-inesctec"]
     job_service.record_host_heartbeat("server", {"executor": "docker", "gpu_enabled": False})
     job_service.record_host_heartbeat(
@@ -1458,7 +1524,12 @@ def test_any_gpu_job_can_be_dispatched_to_union_worker():
     assert dispatched["image"].startswith(f"{settings.JOB_IMAGE_REPOSITORY}:")
 
 
-def test_dispatch_sends_next_attempt_number_to_worker():
+def test_dispatch_sends_next_attempt_number_to_worker(monkeypatch):
+    monkeypatch.setattr(
+        job_service,
+        "_fetch_dockerhub_tag",
+        lambda _repo, tag: ({"name": tag}, False, 123.0),
+    )
     settings.AVAILABLE_HOSTS = ["union-inesctec"]
     job_service.record_host_heartbeat(
         "union-inesctec",
@@ -1720,6 +1791,27 @@ def test_any_cpu_rejects_config_that_requires_gpu():
 
     assert exc.value.status_code == 400
     assert "requires GPU" in str(exc.value.detail)
+
+
+def test_explicit_cpu_host_rejects_config_that_requires_gpu():
+    settings.AVAILABLE_HOSTS = ["server"]
+    job_service.record_host_heartbeat("server", {"executor": "docker", "gpu_enabled": False})
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            job_service.launch_simulation(
+                JobLaunchRequest(
+                    config={
+                        "experiment": {"name": "Bad", "run_name": "CpuHostForGpu"},
+                        "algorithm": {"require_cuda": True},
+                    },
+                    target_host="server",
+                )
+            )
+        )
+
+    assert exc.value.status_code == 400
+    assert "not GPU-capable" in str(exc.value.detail)
 
 
 def test_automatic_dispatch_detects_cuda_required_alias():
@@ -2630,6 +2722,11 @@ def test_mark_stale_union_job_does_not_preserve_acknowledged_terminal_state(monk
 
 
 def test_queued_union_recovery_cannot_be_claimed_by_another_gpu_worker(monkeypatch):
+    monkeypatch.setattr(
+        job_service,
+        "_fetch_dockerhub_tag",
+        lambda _repo, tag: ({"name": tag}, False, 123.0),
+    )
     settings.AVAILABLE_HOSTS = ["union-inesctec", "gpu-worker"]
     monkeypatch.setattr(settings, "PERSISTENT_RECOVERY_WORKER_HOSTS", ["union-inesctec"])
     job_service.record_host_heartbeat("union-inesctec", {"gpu_enabled": True, "executor": "union"})
