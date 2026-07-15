@@ -4,6 +4,11 @@ from app.controllers import ops_controller
 router = APIRouter()
 
 
+@router.post("/ops/workers/{worker_id}/authenticate")
+def authenticate_worker(worker_id: str):
+    return ops_controller.authenticate_worker(worker_id)
+
+
 @router.post("/ops/jobs/{job_id}/requeue")
 def requeue_job(
     job_id: str,

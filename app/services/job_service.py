@@ -20,11 +20,33 @@ from app.status import JobStatus, can_transition
 # In-memory cache of tracked jobs for fast access and testability
 jobs = job_utils.load_jobs()
 host_heartbeats: dict[str, dict] = {}
+worker_commands: dict[str, dict] = {}
+_worker_commands_lock = threading.Lock()
 HEARTBEAT_TTL = settings.HOST_HEARTBEAT_TTL  # backward compatibility for tests
 
 _LOGGER = logging.getLogger(__name__)
 _job_state_locks_guard = threading.Lock()
 _job_state_locks = weakref.WeakValueDictionary()
+
+
+def request_worker_authentication(worker_id: str) -> dict:
+    if worker_id not in settings.AVAILABLE_HOSTS:
+        raise HTTPException(404, f"Unknown worker: {worker_id}")
+    if worker_id != "union-inesctec":
+        raise HTTPException(400, "Interactive authentication is only supported by the Union worker")
+    command = {
+        "action": "union_authenticate",
+        "request_id": str(uuid4()),
+        "requested_at": time.time(),
+    }
+    with _worker_commands_lock:
+        worker_commands[worker_id] = command
+    return {"worker_id": worker_id, **command}
+
+
+def take_worker_command(worker_id: str) -> dict:
+    with _worker_commands_lock:
+        return worker_commands.pop(worker_id, {})
 
 CAPACITY_COUNT_STATUSES = {
     JobStatus.DISPATCHED.value,

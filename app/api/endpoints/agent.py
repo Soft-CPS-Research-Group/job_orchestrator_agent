@@ -1,7 +1,7 @@
 # app/api/endpoints/agent.py
 from fastapi import APIRouter, Response
 from app.controllers import agent_controller
-from app.models.agent import NextJobRequest, StatusRequest, HeartbeatRequest
+from app.models.agent import NextJobRequest, StatusRequest, HeartbeatRequest, WorkerCommandRequest
 
 router = APIRouter()
 
@@ -20,3 +20,8 @@ def job_status(req: StatusRequest):
 @router.post("/api/agent/heartbeat")
 def heartbeat(req: HeartbeatRequest):
     return agent_controller.heartbeat(req)
+
+
+@router.post("/api/agent/worker-command")
+def worker_command(req: WorkerCommandRequest):
+    return agent_controller.worker_command(req)

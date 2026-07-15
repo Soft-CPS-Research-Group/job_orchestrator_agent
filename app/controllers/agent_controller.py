@@ -2,7 +2,7 @@
 import logging
 from fastapi import HTTPException
 from app.services import job_service
-from app.models.agent import NextJobRequest, StatusRequest, HeartbeatRequest
+from app.models.agent import NextJobRequest, StatusRequest, HeartbeatRequest, WorkerCommandRequest
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -33,3 +33,7 @@ def heartbeat(req: HeartbeatRequest):
     _LOGGER.debug("Heartbeat from %s", req.worker_id)
     job_service.record_host_heartbeat(req.worker_id, req.info or {})
     return {"ok": True}
+
+
+def worker_command(req: WorkerCommandRequest):
+    return job_service.take_worker_command(req.worker_id)

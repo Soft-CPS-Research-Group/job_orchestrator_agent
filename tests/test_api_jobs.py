@@ -507,6 +507,26 @@ def test_ops_stop_endpoint(api_client, monkeypatch):
     assert status_payload["stop_reason"] == "ops_manual_stop"
 
 
+def test_union_authentication_command_round_trip(api_client):
+    requested = api_client.post("/ops/workers/union-inesctec/authenticate")
+    assert requested.status_code == 200
+    command = requested.json()
+    assert command["action"] == "union_authenticate"
+
+    delivered = api_client.post(
+        "/api/agent/worker-command",
+        json={"worker_id": "union-inesctec"},
+    )
+    assert delivered.status_code == 200
+    assert delivered.json()["request_id"] == command["request_id"]
+
+    empty = api_client.post(
+        "/api/agent/worker-command",
+        json={"worker_id": "union-inesctec"},
+    )
+    assert empty.json() == {}
+
+
 def test_ops_requeue_endpoint(api_client, monkeypatch):
     from app.config import settings
     from app.services import job_service

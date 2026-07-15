@@ -2,6 +2,10 @@ from fastapi import HTTPException
 from app.services import job_service
 
 
+def authenticate_worker(worker_id: str):
+    return job_service.request_worker_authentication(worker_id)
+
+
 def requeue_job(job_id: str, force: bool = False, preferred_host: str | None = None, require_host: bool | None = None):
     try:
         return job_service.ops_requeue_job(job_id, force, preferred_host, require_host)

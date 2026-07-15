@@ -25,3 +25,7 @@ class StatusRequest(BaseModel):
 class HeartbeatRequest(BaseModel):
     worker_id: str
     info: dict | None = None
+
+
+class WorkerCommandRequest(BaseModel):
+    worker_id: str
