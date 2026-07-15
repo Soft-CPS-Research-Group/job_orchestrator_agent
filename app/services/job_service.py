@@ -2690,6 +2690,8 @@ def _host_status_snapshot() -> dict[str, dict]:
 
         normalized_info["active_job_id"] = raw_info.get("active_job_id") or current_job_id
         normalized_info["active_job_count"] = raw_info.get("active_job_count")
+        normalized_info["running_job_count"] = raw_info.get("running_job_count")
+        normalized_info["provisioning_job_count"] = raw_info.get("provisioning_job_count")
         normalized_info["active_job_ids"] = merged_active_ids
         normalized_info["active_jobs"] = normalized_active_jobs
         normalized_info["last_job_id"] = raw_info.get("last_job_id")
@@ -2717,6 +2719,14 @@ def _host_status_snapshot() -> dict[str, dict]:
             normalized_info["active_job_count"] = sum(profile_counts.values())
         if normalized_info["active_job_count"] is None:
             normalized_info["active_job_count"] = len(merged_active_ids)
+        if normalized_info["running_job_count"] is None:
+            normalized_info["running_job_count"] = sum(
+                row.get("status") == JobStatus.RUNNING.value for row in normalized_active_jobs
+            )
+        if normalized_info["provisioning_job_count"] is None:
+            normalized_info["provisioning_job_count"] = sum(
+                row.get("phase") == "union:provisioning" for row in normalized_active_jobs
+            )
         snapshot[host] = {
             "online": online,
             "last_seen": hb["last_seen"] if hb else None,
