@@ -2638,6 +2638,11 @@ def _normalize_active_jobs_payload(value: Any) -> list[dict[str, Any]]:
         ):
             if key in entry and entry[key] is not None:
                 row[key] = entry[key]
+        gpu_model = entry.get("gpu_model")
+        if isinstance(gpu_model, str):
+            normalized_gpu_model = " ".join(gpu_model.split())[:160]
+            if normalized_gpu_model:
+                row["gpu_model"] = normalized_gpu_model
         normalized.append(row)
     return normalized
 

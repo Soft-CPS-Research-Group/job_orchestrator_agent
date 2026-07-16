@@ -426,6 +426,26 @@ def test_record_host_heartbeat_enforces_known_hosts():
     assert exc.value.status_code == 400
 
 
+def test_host_snapshot_preserves_assigned_gpu_model_for_active_jobs():
+    settings.AVAILABLE_HOSTS = ["union-inesctec"]
+    job_service.record_host_heartbeat(
+        "union-inesctec",
+        {
+            "active_jobs": [
+                {
+                    "job_id": "job-union-gpu",
+                    "status": JobStatus.RUNNING.value,
+                    "phase": "union:running",
+                    "gpu_model": "NVIDIA H200",
+                }
+            ]
+        },
+    )
+
+    [active_job] = job_service._host_status_snapshot()["union-inesctec"]["info"]["active_jobs"]
+    assert active_job["gpu_model"] == "NVIDIA H200"
+
+
 def test_list_jobs_reports_latest_status(monkeypatch):
     settings.MLFLOW_UI_BASE_URL = "https://mlflow-ui.example"
     job_id = "job-list"
