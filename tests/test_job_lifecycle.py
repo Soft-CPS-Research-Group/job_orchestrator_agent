@@ -3227,7 +3227,7 @@ def test_delete_job_removes_artifacts():
     job_service.jobs[job_id] = {
         "job_id": job_id,
         "target_host": "remote",
-        "status": JobStatus.QUEUED.value,
+        "status": JobStatus.FINISHED.value,
     }
     entry = {
         job_id: job_service.jobs[job_id]
@@ -3236,7 +3236,7 @@ def test_delete_job_removes_artifacts():
 
     job_dir = Path(settings.JOBS_DIR) / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    (job_dir / "status.json").write_text(json.dumps({"status": JobStatus.QUEUED.value}))
+    (job_dir / "status.json").write_text(json.dumps({"status": JobStatus.FINISHED.value}))
 
     resp = job_service.delete_job(job_id)
     assert "deleted" in resp["message"]
@@ -3246,14 +3246,51 @@ def test_delete_job_removes_artifacts():
     assert job_id not in job_service.jobs
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        JobStatus.LAUNCHING.value,
+        JobStatus.QUEUED.value,
+        JobStatus.DISPATCHED.value,
+        JobStatus.SETUP.value,
+        JobStatus.RUNNING.value,
+        JobStatus.STOP_REQUESTED.value,
+    ],
+)
+def test_delete_job_rejects_non_terminal_job(status):
+    job_id = f"job-delete-{status}"
+    job_service.jobs[job_id] = {
+        "job_id": job_id,
+        "target_host": "remote",
+        "status": status,
+    }
+    job_utils.save_job(job_id, job_service.jobs[job_id])
+
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps({"status": status}))
+
+    with pytest.raises(HTTPException) as exc:
+        job_service.delete_job(job_id)
+
+    assert exc.value.status_code == 409
+    assert "wait for a terminal status" in str(exc.value.detail)
+    assert job_dir.exists()
+    assert job_id in job_service.jobs
+
+
 def test_delete_job_returns_500_when_filesystem_removal_fails(monkeypatch):
     job_id = "job-delete-fails"
     job_service.jobs[job_id] = {
         "job_id": job_id,
         "target_host": "remote",
-        "status": JobStatus.QUEUED.value,
+        "status": JobStatus.FINISHED.value,
     }
     job_utils.save_job(job_id, job_service.jobs[job_id])
+
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "status.json").write_text(json.dumps({"status": JobStatus.FINISHED.value}))
 
     monkeypatch.setattr(job_utils, "delete_job_by_id", lambda _job_id: False)
 

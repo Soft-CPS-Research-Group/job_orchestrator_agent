@@ -116,7 +116,8 @@ Repeated updates with the same status are accepted (idempotent).
 - `GET /progress/{job_id}`
 - `GET /result/{job_id}`
 - `POST /stop/{job_id}` (set stop_requested or cancel queued)
-- `DELETE /job/{job_id}` (delete artefacts + registry)
+- `DELETE /job/{job_id}` (delete artefacts + registry for terminal jobs only;
+  active jobs must first be stopped/cancelled and return HTTP 409 otherwise)
 
 ### Agent endpoints (worker uses these)
 - `POST /api/agent/next-job`

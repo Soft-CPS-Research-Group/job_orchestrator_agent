@@ -3409,6 +3409,13 @@ def delete_job(job_id: str):
     _mark_stale_jobs()
     if job_id not in jobs:
         raise HTTPException(404, "Job not found or already deleted")
+    job = jobs[job_id]
+    status_now = _read_status_file(job_id) or job.get("status", JobStatus.UNKNOWN.value)
+    if status_now not in TERMINAL_JOB_STATUSES:
+        raise HTTPException(
+            409,
+            f"Job is {status_now}; stop or cancel it and wait for a terminal status before deleting",
+        )
     ok = job_utils.delete_job_by_id(job_id)
     if not ok:
         raise HTTPException(500, "Failed to delete job")
