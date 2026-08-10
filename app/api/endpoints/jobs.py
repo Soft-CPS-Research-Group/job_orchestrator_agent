@@ -1,7 +1,13 @@
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from app.controllers import job_controller
-from app.models.job import JobLaunchRequest
+from app.models.job import (
+    JobFolderAssignmentRequest,
+    JobFolderCreateRequest,
+    JobFolderUpdateRequest,
+    JobLaunchRequest,
+    JobOrganizationOwnerRequest,
+)
 
 router = APIRouter()
 
@@ -54,6 +60,41 @@ async def job_info(job_id: str):
 @router.delete("/job/{job_id}")
 async def delete_job(job_id: str):
     return job_controller.delete_job(job_id)
+
+
+@router.get("/job-folders")
+async def list_job_folders(owner: str = Query(min_length=1, max_length=160)):
+    return job_controller.list_job_folders(owner)
+
+
+@router.post("/job-folders")
+async def create_job_folder(request: JobFolderCreateRequest):
+    return job_controller.create_job_folder(request.owner, request.name)
+
+
+@router.put("/job-folders/{folder_id}")
+async def rename_job_folder(folder_id: str, request: JobFolderUpdateRequest):
+    return job_controller.rename_job_folder(folder_id, request.owner, request.name)
+
+
+@router.delete("/job-folders/{folder_id}")
+async def delete_job_folder(folder_id: str, owner: str = Query(min_length=1, max_length=160)):
+    return job_controller.delete_job_folder(folder_id, owner)
+
+
+@router.put("/job/{job_id}/folder")
+async def move_job_to_folder(job_id: str, request: JobFolderAssignmentRequest):
+    return job_controller.move_job_to_folder(job_id, request.owner, request.folder_id)
+
+
+@router.post("/job/{job_id}/archive")
+async def archive_job(job_id: str, request: JobOrganizationOwnerRequest):
+    return job_controller.archive_job(job_id, request.owner)
+
+
+@router.post("/job/{job_id}/restore")
+async def restore_archived_job(job_id: str, request: JobOrganizationOwnerRequest):
+    return job_controller.restore_archived_job(job_id, request.owner)
 
 @router.get("/file-logs/{job_id}")
 async def file_logs(job_id: str):

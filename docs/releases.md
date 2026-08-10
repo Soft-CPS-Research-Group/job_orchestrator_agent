@@ -66,6 +66,28 @@ Release owner: [@calofonseca](https://github.com/calofonseca).
 - ...
 ```
 
+## Unreleased - 2026-08-10
+
+### Summary
+
+Adds durable Union result recovery observability and metadata-only personal job
+organization.
+
+### Added
+
+- Exposes installed result storage totals for every worker by KPIs, time series,
+  checkpoints, logs and other files.
+- Adds per-submitter flat folders plus a separate archive flag for terminal
+  jobs; restoring an archived job preserves its folder.
+- Preserves archived jobs during automatic ops cleanup.
+
+### API/Storage Impact
+
+- Adds the `/job-folders` endpoints and job folder/archive/restore operations.
+- Adds optional `organization` and `result_storage` fields to job responses.
+- Stores metadata in `jobs/.organization.json`; no existing job directory is
+  moved or renamed.
+
 ## v1.0.0 - 2026-05-16
 
 Release owner: [@calofonseca](https://github.com/calofonseca).

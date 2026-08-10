@@ -6,6 +6,15 @@ def authenticate_worker(worker_id: str):
     return job_service.request_worker_authentication(worker_id)
 
 
+def recover_job(job_id: str):
+    try:
+        return job_service.ops_recover_job(job_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 def requeue_job(job_id: str, force: bool = False, preferred_host: str | None = None, require_host: bool | None = None):
     try:
         return job_service.ops_requeue_job(job_id, force, preferred_host, require_host)

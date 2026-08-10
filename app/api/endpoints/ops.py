@@ -9,6 +9,11 @@ def authenticate_worker(worker_id: str):
     return ops_controller.authenticate_worker(worker_id)
 
 
+@router.post("/ops/jobs/{job_id}/recover")
+def recover_job(job_id: str):
+    return ops_controller.recover_job(job_id)
+
+
 @router.post("/ops/jobs/{job_id}/requeue")
 def requeue_job(
     job_id: str,

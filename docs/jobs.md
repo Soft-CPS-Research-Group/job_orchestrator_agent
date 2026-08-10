@@ -18,12 +18,14 @@ Default root: `/opt/opeva_shared_data` (configurable via `VM_SHARED_DATA`).
 ├── configs/            # YAML experiment configs
 ├── datasets/           # Generated datasets + schema.json
 ├── jobs/
+│   ├── .organization.json  # personal folder/archive metadata
 │   └── <job_id>/
 │       ├── job_info.json
 │       ├── status.json
 │       ├── logs/<job_id>.log
 │       ├── progress/progress.json
-│       └── results/result.json
+│       ├── results/result.json
+│       └── .worker/result-storage.json  # optional installed-result summary
 ├── queue/              # One JSON payload per queued job + claim files
 └── job_track.json      # Registry of known jobs
 ```
@@ -67,12 +69,26 @@ Updated on every state transition. Important fields:
 Server-side registry used for listing and recovery. Mirrors the latest known
 metadata for each job ID.
 
+### jobs/.organization.json
+Server-side metadata for flat, per-user folders and archived jobs. It never
+moves job files on shared storage. Archived jobs are excluded from automatic
+ops cleanup until explicitly restored or deleted.
+
+### jobs/<job_id>/.worker/result-storage.json
+Written by every worker when a job finishes successfully. It contains
+installed byte/file totals split into KPIs, time series, checkpoints, logs and
+other files; Union jobs also include the downloaded archive size. `/jobs` and
+`/job-info/{job_id}` expose it as `result_storage` without rescanning the job
+directory.
+
 ## Job States
 All states (from `app/status.py`):
 - `launching`
 - `queued`
 - `dispatched`
+- `setup`
 - `running`
+- `recovering`
 - `stop_requested`
 - `stopped`
 - `finished`
@@ -82,10 +98,11 @@ All states (from `app/status.py`):
 - `unknown` (utility)
 
 ### Normal Transition Paths
-- `launching -> queued -> dispatched -> running -> finished|failed`
+- `launching -> queued -> dispatched -> setup -> running -> finished|failed`
+- Union success: `running -> recovering -> finished`
 
 ### Stop Flow
-- `dispatched|running -> stop_requested -> stopped`
+- `dispatched|setup|running|recovering -> stop_requested -> stopped`
 
 ### Cancel Before Start
 - `launching|queued -> canceled`
@@ -94,6 +111,8 @@ All states (from `app/status.py`):
 - `dispatched -> queued` when status updates are stale or worker disappears
 - `running|stop_requested -> failed` when status updates are stale or worker
   disappears
+- `recovering` is preserved until the durable Union result is installed or an
+  operator stops it. It is never redistributed to another worker.
 
 Invalid transitions return HTTP 409 on `/api/agent/job-status`.
 Repeated updates with the same status are accepted (idempotent).
@@ -115,6 +134,11 @@ Repeated updates with the same status are accepted (idempotent).
 - `GET /file-logs/{job_id}` (file stream)
 - `GET /progress/{job_id}`
 - `GET /result/{job_id}`
+- `GET /job-folders?owner=<submitted_by>`
+- `POST /job-folders` and `PUT|DELETE /job-folders/{folder_id}`
+- `PUT /job/{job_id}/folder` (metadata-only move to a personal flat folder)
+- `POST /job/{job_id}/archive` (terminal jobs only)
+- `POST /job/{job_id}/restore` (restores the previous folder assignment)
 - `POST /stop/{job_id}` (set stop_requested or cancel queued)
 - `DELETE /job/{job_id}` (delete artefacts + registry for terminal jobs only;
   active jobs must first be stopped/cancelled and return HTTP 409 otherwise)
@@ -145,13 +169,16 @@ Repeated updates with the same status are accepted (idempotent).
       "container_name": "opeva_job_demo_1234"
     }
     ```
-  - Allowed statuses: `running`, `stop_requested`, `stopped`, `finished`,
+  - Allowed statuses: `running`, `recovering`, `stop_requested`, `stopped`, `finished`,
     `failed` (plus any other valid transitions)
 
 - `POST /api/agent/heartbeat`
   - Body: `{ "worker_id": "tiago-gpu", "info": { "load": 0.5 } }`
 
 ### Ops endpoints (manual recovery)
+- `POST /ops/jobs/{job_id}/recover`
+  - Union only. Requires persisted evidence that remote compute succeeded.
+  - Retries result download/installation and does not submit compute again.
 - `POST /ops/jobs/{job_id}/requeue` (force optional)
 - `POST /ops/jobs/{job_id}/fail` (force optional)
 - `POST /ops/jobs/{job_id}/cancel` (force optional)
@@ -246,6 +273,7 @@ These settings are in `app/config.py`:
 Server behavior:
 - Dispatched jobs with stale status are requeued.
 - Running or stop_requested jobs with stale status are marked failed.
+- Recovering Union jobs are retained for durable result reconciliation.
 - If a worker is offline beyond TTL + grace, its running jobs are failed and
   dispatched jobs are requeued.
 
@@ -256,6 +284,8 @@ while running.
 - `POST /stop/{job_id}` on the API does **not** directly stop a container.
 - For running/dispatched jobs, the API sets `stop_requested` and expects the
   worker to terminate the job and report `stopped`.
+- For recovering Union jobs, the worker skips result download and performs
+  best-effort cleanup of the remote object before reporting `stopped`.
 - For queued jobs, the API cancels them immediately (`canceled`).
 
 ## Ops Controls
@@ -264,6 +294,8 @@ Use with caution because requeueing can cause duplicate execution if a worker
 is still running the original job.
 
 - `requeue`: moves job back to queue; `force=true` bypasses state checks.
+- `recover`: resumes only a successful Union result transfer; it cannot rerun a
+  failed remote compute.
 - `fail`: marks job failed with a reason; `force=true` bypasses state checks.
 - `cancel`: marks job canceled with a reason; `force=true` bypasses state checks.
 - `cleanup`: removes queue entries with missing/invalid job metadata.

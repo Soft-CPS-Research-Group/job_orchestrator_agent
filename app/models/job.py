@@ -34,3 +34,24 @@ class JobLaunchRequest(BaseModel):
 class SimulationRequest(BaseModel):
     config_path: str
     job_name: Optional[str] = None
+
+
+class JobFolderCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner: str = Field(min_length=1, max_length=160)
+    name: str = Field(min_length=1, max_length=80)
+
+
+class JobFolderUpdateRequest(JobFolderCreateRequest):
+    pass
+
+
+class JobOrganizationOwnerRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    owner: str = Field(min_length=1, max_length=160)
+
+
+class JobFolderAssignmentRequest(JobOrganizationOwnerRequest):
+    folder_id: Optional[str] = None

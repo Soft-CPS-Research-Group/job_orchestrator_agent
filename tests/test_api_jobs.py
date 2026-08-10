@@ -179,6 +179,122 @@ def test_queue_endpoint_lists_entries(api_client, monkeypatch):
     assert any(entry.get("job_id") == job_id for entry in entries)
 
 
+def test_job_folders_and_archive_are_personal_metadata(api_client, monkeypatch):
+    from app.config import settings
+    from app.services import job_service
+
+    monkeypatch.setattr(settings, "AVAILABLE_HOSTS", ["worker-a"])
+    response = api_client.post(
+        "/run-simulation",
+        json={
+            "config": {"experiment": {"name": "Organized", "run_name": "Run"}},
+            "target_host": "worker-a",
+            "submitted_by": "Gustavo Santos",
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    folder_response = api_client.post(
+        "/job-folders",
+        json={"owner": "Gustavo Santos", "name": "TPPO studies"},
+    )
+    assert folder_response.status_code == 200
+    folder_id = folder_response.json()["folder_id"]
+    assert api_client.get("/job-folders", params={"owner": "Gustavo Santos"}).json()[0]["folder_id"] == folder_id
+    assert api_client.get("/job-folders", params={"owner": "Tiago Fonseca"}).json() == []
+
+    move_response = api_client.put(
+        f"/job/{job_id}/folder",
+        json={"owner": "Gustavo Santos", "folder_id": folder_id},
+    )
+    assert move_response.status_code == 200
+    assert move_response.json()["organization"]["folder_id"] == folder_id
+
+    queued_archive = api_client.post(
+        f"/job/{job_id}/archive",
+        json={"owner": "Gustavo Santos"},
+    )
+    assert queued_archive.status_code == 409
+
+    with job_service._job_state_lock(job_id):
+        job_service._force_status(job_id, "finished")
+    wrong_owner = api_client.post(
+        f"/job/{job_id}/archive",
+        json={"owner": "Tiago Fonseca"},
+    )
+    assert wrong_owner.status_code == 403
+
+    archive_response = api_client.post(
+        f"/job/{job_id}/archive",
+        json={"owner": "Gustavo Santos"},
+    )
+    assert archive_response.status_code == 200
+    organization = archive_response.json()["organization"]
+    assert organization["archived"] is True
+    assert organization["folder_id"] == folder_id
+
+    listed = next(item for item in api_client.get("/jobs").json() if item["job_id"] == job_id)
+    assert listed["organization"]["archived"] is True
+    assert listed["organization"]["folder_id"] == folder_id
+
+    restore_response = api_client.post(
+        f"/job/{job_id}/restore",
+        json={"owner": "Gustavo Santos"},
+    )
+    assert restore_response.status_code == 200
+    assert restore_response.json()["organization"]["archived"] is False
+    assert restore_response.json()["organization"]["folder_id"] == folder_id
+
+    delete_folder = api_client.delete(
+        f"/job-folders/{folder_id}",
+        params={"owner": "Gustavo Santos"},
+    )
+    assert delete_folder.status_code == 200
+    listed = next(item for item in api_client.get("/jobs").json() if item["job_id"] == job_id)
+    assert listed["organization"]["folder_id"] is None
+
+    assert api_client.post(f"/job/{job_id}/archive", json={"owner": "Gustavo Santos"}).status_code == 200
+    cleanup = api_client.post("/ops/jobs/cleanup", json={})
+    assert cleanup.status_code == 200
+    assert job_id in cleanup.json()["archived_kept"]
+    assert any(item["job_id"] == job_id for item in api_client.get("/jobs").json())
+
+
+def test_job_info_exposes_result_storage_manifest(api_client, monkeypatch):
+    from app.config import settings
+
+    monkeypatch.setattr(settings, "AVAILABLE_HOSTS", ["worker-a"])
+    response = api_client.post(
+        "/run-simulation",
+        json={
+            "config": {"experiment": {"name": "Storage", "run_name": "Run"}},
+            "target_host": "worker-a",
+            "submitted_by": "Tiago Fonseca",
+        },
+    )
+    job_id = response.json()["job_id"]
+    worker_dir = Path(settings.JOBS_DIR) / job_id / ".worker"
+    worker_dir.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "schema_version": 1,
+        "measured_at": 123.0,
+        "transfer": {"bytes": 10, "announced_unpacked_bytes": 20, "announced_file_count": 2},
+        "installed": {
+            "bytes": 22,
+            "file_count": 2,
+            "categories": {"kpis": {"bytes": 8, "file_count": 1}, "other": {"bytes": 14, "file_count": 1}},
+        },
+    }
+    (worker_dir / "result-storage.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    info = api_client.get(f"/job-info/{job_id}")
+    assert info.status_code == 200
+    assert info.json()["result_storage"] == manifest
+    listed = next(item for item in api_client.get("/jobs").json() if item["job_id"] == job_id)
+    assert listed["job_info"]["result_storage"] == manifest
+
+
 def test_run_simulation_allows_job_name_and_submitted_by(api_client, monkeypatch):
     from app.config import settings
 
@@ -525,6 +641,102 @@ def test_union_authentication_command_round_trip(api_client):
         json={"worker_id": "union-inesctec"},
     )
     assert empty.json() == {}
+
+
+def test_union_result_recovery_command_does_not_requeue_compute(api_client):
+    from app.config import settings
+    from app.services import job_service
+    from app.status import JobStatus
+    from app.utils import job_utils
+
+    job_service.worker_commands.clear()
+    job_id = "union-result-recovery"
+    metadata = {
+        "job_id": job_id,
+        "status": JobStatus.FAILED.value,
+        "target_host": "union-inesctec",
+        "preferred_host": "union-inesctec",
+        "details": {
+            "union_phase": "ActionPhase.SUCCEEDED",
+            "compute_succeeded": True,
+        },
+    }
+    job_service.jobs[job_id] = metadata
+    job_utils.save_job(job_id, metadata)
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    state_dir = job_dir / ".worker"
+    state_dir.mkdir(parents=True)
+    job_utils.write_status_file(job_id, JobStatus.FAILED.value, {"error": "old recovery failure"})
+    (state_dir / "union.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "run_name": "opeva-successful-run",
+                "run_url": "https://union.invalid/run",
+                "result_uri": "s3://bucket/result.tar.gz",
+                "union_phase": "ActionPhase.SUCCEEDED",
+                "compute_succeeded": True,
+                "compute_finished_at": 1234.0,
+                "terminal": True,
+                "terminal_status": "failed",
+            }
+        )
+    )
+
+    response = api_client.post(f"/ops/jobs/{job_id}/recover")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == JobStatus.RECOVERING.value
+    status_payload = json.loads((job_dir / "status.json").read_text())
+    assert status_payload["status"] == JobStatus.RECOVERING.value
+    assert status_payload["details"]["compute_succeeded"] is True
+    assert not (Path(settings.QUEUE_DIR) / f"{job_id}.json").exists()
+    recovery_request = json.loads((state_dir / "union-recovery-request.json").read_text())
+    assert recovery_request["action"] == "union_recover_job"
+    assert recovery_request["job_id"] == job_id
+
+    command = api_client.post(
+        "/api/agent/worker-command",
+        json={"worker_id": "union-inesctec"},
+    ).json()
+    assert command["action"] == "union_recover_job"
+    assert command["job_id"] == job_id
+
+
+def test_union_result_recovery_rejects_failed_compute(api_client):
+    from app.config import settings
+    from app.services import job_service
+    from app.status import JobStatus
+    from app.utils import job_utils
+
+    job_id = "union-compute-failed"
+    metadata = {
+        "job_id": job_id,
+        "status": JobStatus.FAILED.value,
+        "target_host": "union-inesctec",
+    }
+    job_service.jobs[job_id] = metadata
+    job_utils.save_job(job_id, metadata)
+    job_dir = Path(settings.JOBS_DIR) / job_id
+    state_dir = job_dir / ".worker"
+    state_dir.mkdir(parents=True)
+    job_utils.write_status_file(job_id, JobStatus.FAILED.value, {"error": "compute failed"})
+    (state_dir / "union.json").write_text(
+        json.dumps(
+            {
+                "job_id": job_id,
+                "run_name": "opeva-failed-run",
+                "result_uri": "s3://bucket/result.tar.gz",
+                "union_phase": "ActionPhase.FAILED",
+                "compute_succeeded": False,
+            }
+        )
+    )
+
+    response = api_client.post(f"/ops/jobs/{job_id}/recover")
+
+    assert response.status_code == 409
+    assert "did not finish successfully" in response.json()["detail"]
 
 
 def test_ops_requeue_endpoint(api_client, monkeypatch):

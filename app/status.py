@@ -10,6 +10,7 @@ class JobStatus(str, Enum):
 
     # active
     RUNNING = "running"          # container started
+    RECOVERING = "recovering"    # remote compute succeeded; installing results locally
 
     # terminal
     FINISHED = "finished"        # exit code 0
@@ -35,8 +36,29 @@ ALLOWED_TRANSITIONS = {
         JobStatus.STOP_REQUESTED,
         JobStatus.QUEUED,
     },
-    JobStatus.SETUP: {JobStatus.RUNNING, JobStatus.FAILED, JobStatus.CANCELED, JobStatus.STOP_REQUESTED, JobStatus.QUEUED},
-    JobStatus.RUNNING: {JobStatus.FINISHED, JobStatus.FAILED, JobStatus.STOP_REQUESTED, JobStatus.STOPPED, JobStatus.CANCELED},
+    JobStatus.SETUP: {
+        JobStatus.RUNNING,
+        JobStatus.RECOVERING,
+        JobStatus.FAILED,
+        JobStatus.CANCELED,
+        JobStatus.STOP_REQUESTED,
+        JobStatus.QUEUED,
+    },
+    JobStatus.RUNNING: {
+        JobStatus.RECOVERING,
+        JobStatus.FINISHED,
+        JobStatus.FAILED,
+        JobStatus.STOP_REQUESTED,
+        JobStatus.STOPPED,
+        JobStatus.CANCELED,
+    },
+    JobStatus.RECOVERING: {
+        JobStatus.FINISHED,
+        JobStatus.FAILED,
+        JobStatus.STOP_REQUESTED,
+        JobStatus.STOPPED,
+        JobStatus.CANCELED,
+    },
     JobStatus.STOP_REQUESTED: {JobStatus.STOPPED, JobStatus.FAILED, JobStatus.CANCELED},
     JobStatus.FINISHED: set(),
     JobStatus.FAILED: set(),

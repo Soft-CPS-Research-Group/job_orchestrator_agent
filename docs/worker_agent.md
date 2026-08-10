@@ -59,6 +59,12 @@ are documented in `docs/jobs.md`.
   container metadata.
 - **Stop requested:** if the API sets `status="stop_requested"`, the worker
   must terminate the container and respond with `status="stopped"`.
+- **Union result recovery:** after successful remote compute, POST
+  `status="recovering"` until the validated result is installed locally and
+  remote cleanup completes. A `union_recover_job` worker command resumes the
+  persisted recovery state without submitting a new remote execution. The
+  request is also persisted in the job's `.worker` directory so it survives an
+  orchestrator restart before command delivery.
 - **Cancellation:** queued jobs can be cancelled by the API (`canceled`).
 
 ## Heartbeats

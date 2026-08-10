@@ -13,14 +13,14 @@ from urllib import error as urllib_error
 
 from app.config import settings
 from app.models.job import JobLaunchRequest
-from app.services import email_notification_service
+from app.services import email_notification_service, job_organization_service
 from app.utils import job_utils, file_utils
 from app.status import JobStatus, can_transition
 
 # In-memory cache of tracked jobs for fast access and testability
 jobs = job_utils.load_jobs()
 host_heartbeats: dict[str, dict] = {}
-worker_commands: dict[str, dict] = {}
+worker_commands: dict[str, deque[dict]] = {}
 _worker_commands_lock = threading.Lock()
 HEARTBEAT_TTL = settings.HOST_HEARTBEAT_TTL  # backward compatibility for tests
 
@@ -39,19 +39,31 @@ def request_worker_authentication(worker_id: str) -> dict:
         "request_id": str(uuid4()),
         "requested_at": time.time(),
     }
-    with _worker_commands_lock:
-        worker_commands[worker_id] = command
+    _queue_worker_command(worker_id, command)
     return {"worker_id": worker_id, **command}
+
+
+def _queue_worker_command(worker_id: str, command: dict) -> None:
+    with _worker_commands_lock:
+        worker_commands.setdefault(worker_id, deque()).append(command)
 
 
 def take_worker_command(worker_id: str) -> dict:
     with _worker_commands_lock:
-        return worker_commands.pop(worker_id, {})
+        pending = worker_commands.get(worker_id)
+        if not pending:
+            worker_commands.pop(worker_id, None)
+            return {}
+        command = pending.popleft()
+        if not pending:
+            worker_commands.pop(worker_id, None)
+        return command
 
 CAPACITY_COUNT_STATUSES = {
     JobStatus.DISPATCHED.value,
     JobStatus.SETUP.value,
     JobStatus.RUNNING.value,
+    JobStatus.RECOVERING.value,
     JobStatus.STOP_REQUESTED.value,
 }
 
@@ -59,6 +71,7 @@ ACTIVE_JOB_STATUSES = {
     JobStatus.DISPATCHED.value,
     JobStatus.SETUP.value,
     JobStatus.RUNNING.value,
+    JobStatus.RECOVERING.value,
     JobStatus.STOP_REQUESTED.value,
 }
 
@@ -97,6 +110,7 @@ ATTEMPT_LIFECYCLE_RESET_FIELDS = {
     "dispatched_at",
     "setup_at",
     "started_at",
+    "compute_finished_at",
     "stop_requested_at",
     "finished_at",
     "last_status_at",
@@ -288,6 +302,49 @@ def _job_exists(job_id: str) -> bool:
         return job_id in job_utils.load_jobs()
     except Exception:
         return False
+
+
+def _result_storage_path(job_id: str) -> Path:
+    return Path(_job_dir(job_id)) / ".worker" / "result-storage.json"
+
+
+def _read_result_storage(job_id: str) -> dict | None:
+    try:
+        payload = json.loads(_result_storage_path(job_id).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    installed = payload.get("installed")
+    transfer = payload.get("transfer")
+    if not isinstance(installed, dict) or not isinstance(transfer, dict):
+        return None
+    return payload
+
+
+def _job_submitter(job_id: str, meta: dict | None = None) -> str:
+    payload = meta or jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {}
+    submitted_by = payload.get("submitted_by")
+    if isinstance(submitted_by, str) and submitted_by.strip():
+        return submitted_by.strip()
+    try:
+        info = _read_job_info_payload(job_id)
+    except Exception:
+        return ""
+    submitted_by = info.get("submitted_by")
+    return submitted_by.strip() if isinstance(submitted_by, str) else ""
+
+
+def _require_job_organization_owner(job_id: str, owner: str, meta: dict | None = None) -> str:
+    requested = " ".join(owner.strip().split())
+    if not requested:
+        raise HTTPException(400, "Organization owner is required")
+    submitter = _job_submitter(job_id, meta)
+    if not submitter:
+        raise HTTPException(409, "This legacy job has no submitter and cannot be organized")
+    if job_organization_service.normalize_owner(submitter) != job_organization_service.normalize_owner(requested):
+        raise HTTPException(403, "Jobs can only be organized by their submitter")
+    return requested
 
 # ---------- helpers ----------
 def _slug(s: str) -> str:
@@ -584,6 +641,9 @@ def _apply_lifecycle_metadata(meta: dict, *, prev_status: str | None, status: st
                 meta.pop("started_at", None)
             else:
                 meta["started_at"] = status_ts
+    elif status == JobStatus.RECOVERING.value:
+        meta.setdefault("queued_at", status_ts)
+        meta.pop("finished_at", None)
     elif status == JobStatus.STOP_REQUESTED.value:
         meta["stop_requested_at"] = status_ts
 
@@ -601,9 +661,16 @@ def _apply_detail_timestamps(meta: dict, details: dict, *, status_ts: float) -> 
     started_candidates = (
         details.get("started_at"),
     )
+    compute_finished_candidates = (
+        details.get("compute_finished_at"),
+    )
 
     queued_ts = next((candidate for candidate in (_parse_timestamp(v) for v in queued_candidates) if candidate is not None), None)
     started_ts = next((candidate for candidate in (_parse_timestamp(v) for v in started_candidates) if candidate is not None), None)
+    compute_finished_ts = next(
+        (candidate for candidate in (_parse_timestamp(v) for v in compute_finished_candidates) if candidate is not None),
+        None,
+    )
 
     current_queued = _ensure_float(meta.get("queued_at"))
     if queued_ts is not None:
@@ -618,6 +685,9 @@ def _apply_detail_timestamps(meta: dict, details: dict, *, status_ts: float) -> 
             meta["started_at"] = started_ts
         else:
             meta["started_at"] = min(current_started, started_ts)
+
+    if compute_finished_ts is not None:
+        meta["compute_finished_at"] = compute_finished_ts
 
     # Queue timing is backend lifecycle timing: queue ends when leaving dispatched/running path.
     if meta.get("status") in TERMINAL_JOB_STATUSES and _ensure_float(meta.get("started_at")) is None:
@@ -702,6 +772,7 @@ def _compute_job_durations(meta: dict, now_ts: float | None = None) -> dict:
     started_at = _ensure_float(meta.get("started_at"))
     dispatched_at = _ensure_float(meta.get("dispatched_at"))
     finished_at = _ensure_float(meta.get("finished_at"))
+    compute_finished_at = _ensure_float(meta.get("compute_finished_at"))
     status = str(meta.get("status") or "")
 
     if status not in TERMINAL_JOB_STATUSES:
@@ -717,7 +788,7 @@ def _compute_job_durations(meta: dict, now_ts: float | None = None) -> dict:
 
     run_duration_seconds = None
     if started_at is not None:
-        run_end = finished_at or now
+        run_end = compute_finished_at or finished_at or now
         run_duration_seconds = max(0.0, run_end - started_at)
 
     total_duration_seconds = None
@@ -2810,6 +2881,9 @@ def _mark_stale_job_locked(job_id: str, meta: dict, now: float) -> None:
     host = meta.get("target_host")
     if status not in ACTIVE_JOB_STATUSES:
         return
+    if status == JobStatus.RECOVERING.value:
+        _LOGGER.info("Keeping recovering job %s until its Union result is installed", job_id)
+        return
     if _has_pending_persistent_worker_recovery(job_id, meta):
         _LOGGER.info(
             "Keeping %s job %s for persistent recovery by worker %s",
@@ -3124,6 +3198,7 @@ def get_logs(job_id: str):
         JobStatus.DISPATCHED.value,
         JobStatus.SETUP.value,
         JobStatus.RUNNING.value,
+        JobStatus.RECOVERING.value,
         JobStatus.STOP_REQUESTED.value,
     }:
         def _msg():
@@ -3178,6 +3253,7 @@ def get_logs_chunk(
         JobStatus.DISPATCHED.value,
         JobStatus.SETUP.value,
         JobStatus.RUNNING.value,
+        JobStatus.RECOVERING.value,
         JobStatus.STOP_REQUESTED.value,
     }:
         return {
@@ -3212,7 +3288,12 @@ def stop_job(job_id: str, reason: str = "stop_requested", requested_by_ops: bool
             _persist_job(job_id, jobs[job_id])
         return {"message": "Job canceled from queue"}
 
-    if status_now in (JobStatus.DISPATCHED.value, JobStatus.SETUP.value, JobStatus.RUNNING.value):
+    if status_now in (
+        JobStatus.DISPATCHED.value,
+        JobStatus.SETUP.value,
+        JobStatus.RUNNING.value,
+        JobStatus.RECOVERING.value,
+    ):
         extra = {"stop_requested": True, "stop_reason": reason}
         if requested_by_ops:
             extra["stopped_by_ops"] = True
@@ -3241,6 +3322,7 @@ def list_jobs():
     queue_entries = job_utils.list_queue()
     queued_start_estimates = _queued_start_estimates(queue_entries)
     result = []
+    organizations = job_organization_service.get_job_organizations(list(jobs))
     for job_id, job in jobs.items():
         merged = dict(job)
         merged["job_id"] = job_id
@@ -3265,6 +3347,9 @@ def list_jobs():
         info.setdefault("image_tag", merged.get("image_tag"))
         info.setdefault("deucalion_options", merged.get("deucalion_options"))
         info.setdefault("image", merged.get("image") or settings.DEFAULT_JOB_IMAGE)
+        result_storage = _read_result_storage(job_id)
+        if result_storage is not None:
+            info["result_storage"] = result_storage
         info = _without_email_notification_metadata(info)
 
         status_payload = get_status(job_id)
@@ -3292,6 +3377,7 @@ def list_jobs():
             "requeue_count": int(merged.get("requeue_count", 0) or 0),
             "attempt_number": int(merged.get("attempt_number", 0) or 0),
             "job_meta": _public_job_metadata(merged),
+            "organization": organizations[job_id],
         }
         queued_start_estimate = queued_start_estimates.get(job_id)
         if queued_start_estimate:
@@ -3354,6 +3440,10 @@ def get_job_info(job_id: str):
         info["last_email_notification"] = meta.get("last_email_notification")
     if "email_notifications" not in info and meta.get("email_notifications"):
         info["email_notifications"] = meta.get("email_notifications")
+    result_storage = _read_result_storage(job_id)
+    if result_storage is not None:
+        info["result_storage"] = result_storage
+    info["organization"] = job_organization_service.get_job_organization(job_id)
 
     # Expose lifecycle timing in job details overview.
     status_payload = _read_status_payload(job_id) or {}
@@ -3421,7 +3511,73 @@ def delete_job(job_id: str):
         raise HTTPException(500, "Failed to delete job")
     job_utils.remove_from_queue(job_id)
     jobs.pop(job_id, None)
+    try:
+        job_organization_service.remove_job(job_id)
+    except OSError:
+        _LOGGER.warning("Failed to remove organization metadata for deleted job %s", job_id, exc_info=True)
     return {"message": f"Job {job_id} deleted successfully"}
+
+
+def list_job_folders(owner: str) -> list[dict]:
+    return job_organization_service.list_folders(owner)
+
+
+def create_job_folder(owner: str, name: str) -> dict:
+    try:
+        return job_organization_service.create_folder(owner, name)
+    except ValueError as exc:
+        raise HTTPException(409 if "already exists" in str(exc) else 400, str(exc))
+
+
+def rename_job_folder(folder_id: str, owner: str, name: str) -> dict:
+    try:
+        return job_organization_service.rename_folder(folder_id, owner, name)
+    except KeyError:
+        raise HTTPException(404, "Folder not found")
+    except ValueError as exc:
+        raise HTTPException(409 if "already exists" in str(exc) else 400, str(exc))
+
+
+def delete_job_folder(folder_id: str, owner: str) -> dict:
+    try:
+        job_organization_service.delete_folder(folder_id, owner)
+    except KeyError:
+        raise HTTPException(404, "Folder not found")
+    return {"message": "Folder deleted; its jobs remain available in General", "folder_id": folder_id}
+
+
+def move_job_to_folder(job_id: str, owner: str, folder_id: str | None) -> dict:
+    _refresh_jobs()
+    if not _job_exists(job_id):
+        raise HTTPException(404, "Job not found")
+    requested_owner = _require_job_organization_owner(job_id, owner)
+    try:
+        organization = job_organization_service.set_job_folder(job_id, requested_owner, folder_id)
+    except KeyError:
+        raise HTTPException(404, "Folder not found")
+    return {"message": "Job folder updated", "job_id": job_id, "organization": organization}
+
+
+def archive_job(job_id: str, owner: str) -> dict:
+    _refresh_jobs()
+    if not _job_exists(job_id):
+        raise HTTPException(404, "Job not found")
+    meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {}) or {}
+    status_now = _read_status_file(job_id) or meta.get("status", JobStatus.UNKNOWN.value)
+    if status_now not in TERMINAL_JOB_STATUSES:
+        raise HTTPException(409, f"Job is {status_now}; only terminal jobs can be archived")
+    requested_owner = _require_job_organization_owner(job_id, owner, meta)
+    organization = job_organization_service.set_job_archived(job_id, requested_owner, archived=True)
+    return {"message": "Job archived", "job_id": job_id, "organization": organization}
+
+
+def restore_archived_job(job_id: str, owner: str) -> dict:
+    _refresh_jobs()
+    if not _job_exists(job_id):
+        raise HTTPException(404, "Job not found")
+    requested_owner = _require_job_organization_owner(job_id, owner)
+    organization = job_organization_service.set_job_archived(job_id, requested_owner, archived=False)
+    return {"message": "Job restored", "job_id": job_id, "organization": organization}
 
 def get_hosts():
     _refresh_jobs()
@@ -3560,6 +3716,117 @@ def ops_requeue_job(
         return _ops_requeue_job_locked(job_id, force, preferred_host, require_host)
 
 
+def _union_state_path(job_id: str) -> Path:
+    return Path(_job_dir(job_id)) / ".worker" / "union.json"
+
+
+def _union_recovery_request_path(job_id: str) -> Path:
+    return Path(_job_dir(job_id)) / ".worker" / "union-recovery-request.json"
+
+
+def _write_union_recovery_request(job_id: str, command: dict) -> None:
+    path = _union_recovery_request_path(job_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(json.dumps(command, indent=2, sort_keys=True), encoding="utf-8")
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, path)
+
+
+def _read_union_state(job_id: str) -> dict:
+    path = _union_state_path(job_id)
+    try:
+        with path.open() as handle:
+            payload = json.load(handle)
+    except FileNotFoundError:
+        raise HTTPException(409, "Union recovery metadata is not available for this job")
+    except (OSError, ValueError) as exc:
+        raise HTTPException(409, f"Union recovery metadata cannot be read: {exc}")
+    if not isinstance(payload, dict):
+        raise HTTPException(409, "Union recovery metadata is invalid")
+    return payload
+
+
+def _union_compute_succeeded(state: dict) -> bool:
+    if state.get("compute_succeeded") is True:
+        return True
+    phase = str(state.get("union_phase") or "").strip().upper()
+    return phase == "SUCCEEDED" or phase.endswith(".SUCCEEDED")
+
+
+def ops_recover_job(job_id: str) -> dict:
+    """Retry installation of a successful Union result without rerunning compute."""
+    _refresh_jobs()
+    if not _job_exists(job_id):
+        raise HTTPException(404, f"Job {job_id} not found")
+    with _job_state_lock(job_id):
+        _refresh_jobs()
+        meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {})
+        status_now = _read_status_file(job_id) or meta.get("status", JobStatus.UNKNOWN.value)
+        worker_id = str(
+            meta.get("target_host")
+            or meta.get("preferred_host")
+            or meta.get("worker_id")
+            or meta.get("last_host")
+            or ""
+        )
+        if not _is_union_worker(worker_id):
+            raise HTTPException(409, "Result recovery is only supported for Union jobs")
+        if status_now not in {JobStatus.FAILED.value, JobStatus.RECOVERING.value}:
+            raise HTTPException(409, f"Job is {status_now}; only failed or recovering jobs can retry result recovery")
+
+        state = _read_union_state(job_id)
+        if not _union_compute_succeeded(state):
+            raise HTTPException(409, "Union compute did not finish successfully; recovery would require rerunning the job")
+        if state.get("artifact_deleted") is True and state.get("artifact_installed") is not True:
+            raise HTTPException(409, "The remote result was already deleted before it was installed")
+        if state.get("artifact_installed") is not True and not state.get("result_uri"):
+            raise HTTPException(409, "Union result location is missing from recovery metadata")
+        if not state.get("run_name"):
+            raise HTTPException(409, "Union run identifier is missing from recovery metadata")
+
+        request_id = str(uuid4())
+        requested_at = time.time()
+        command = {
+            "action": "union_recover_job",
+            "job_id": job_id,
+            "request_id": request_id,
+            "requested_at": requested_at,
+        }
+        _write_union_recovery_request(job_id, command)
+        previous_details = meta.get("details") if isinstance(meta.get("details"), dict) else {}
+        details = {
+            **previous_details,
+            "executor_stage": "union:recovery_requested",
+            "union_run_id": state.get("run_name"),
+            "union_run_url": state.get("run_url"),
+            "union_phase": state.get("union_phase"),
+            "compute_succeeded": True,
+            "compute_finished_at": state.get("compute_finished_at"),
+            "recovery_status": "requested",
+            "recovery_request_id": request_id,
+        }
+        extra = {
+            "error": None,
+            "recovery_requested_at": requested_at,
+            "recovery_request_id": request_id,
+            "details": details,
+        }
+        if status_now == JobStatus.FAILED.value:
+            _force_status(job_id, JobStatus.RECOVERING.value, extra)
+        else:
+            _write_status(job_id, JobStatus.RECOVERING.value, extra)
+
+        _queue_worker_command("union-inesctec", command)
+        return {
+            "message": "Union result recovery requested",
+            "job_id": job_id,
+            "status": JobStatus.RECOVERING.value,
+            "worker_id": "union-inesctec",
+            "request_id": request_id,
+        }
+
+
 def _ops_requeue_job_locked(
     job_id: str,
     force: bool,
@@ -3589,7 +3856,12 @@ def _ops_requeue_job_locked(
     if not force:
         if status_now == JobStatus.FINISHED.value:
             raise HTTPException(409, "Finished jobs require force to requeue")
-        if status_now in (JobStatus.SETUP.value, JobStatus.RUNNING.value, JobStatus.STOP_REQUESTED.value):
+        if status_now in (
+            JobStatus.SETUP.value,
+            JobStatus.RUNNING.value,
+            JobStatus.RECOVERING.value,
+            JobStatus.STOP_REQUESTED.value,
+        ):
             raise HTTPException(409, f"Job is {status_now}; stop it first or use force to requeue")
 
     prev_host = meta.get("target_host")
@@ -3762,6 +4034,8 @@ def ops_cleanup_jobs(keep: list[str] | None = None) -> dict:
     keep_set = set(DEFAULT_JOB_CLEANUP_KEEP)
     if keep:
         keep_set.update(keep)
+    archived_kept = job_organization_service.archived_job_ids()
+    keep_set.update(archived_kept)
 
     tracked = job_utils.load_jobs()
     # Never remove active jobs by default; cleanup is intended for stale/terminal data.
@@ -3793,6 +4067,7 @@ def ops_cleanup_jobs(keep: list[str] | None = None) -> dict:
     for job_id in removed:
         job_utils.remove_from_queue(job_id)
         jobs.pop(job_id, None)
+    job_organization_service.remove_jobs(set(removed))
 
     # Remove orphan directories not present in tracked jobs and not explicitly kept.
     tracked_after = set(job_utils.load_jobs().keys())
@@ -3840,6 +4115,7 @@ def ops_cleanup_jobs(keep: list[str] | None = None) -> dict:
         "filesystem_errors": filesystem_errors,
         "kept": kept,
         "active_kept": sorted(active_kept),
+        "archived_kept": sorted(archived_kept),
         "count": len(removed),
     }
 

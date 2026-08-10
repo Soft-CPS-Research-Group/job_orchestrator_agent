@@ -42,6 +42,34 @@ def get_job_info(job_id: str):
 def delete_job(job_id: str):
     return job_service.delete_job(job_id)
 
+
+def list_job_folders(owner: str):
+    return job_service.list_job_folders(owner)
+
+
+def create_job_folder(owner: str, name: str):
+    return job_service.create_job_folder(owner, name)
+
+
+def rename_job_folder(folder_id: str, owner: str, name: str):
+    return job_service.rename_job_folder(folder_id, owner, name)
+
+
+def delete_job_folder(folder_id: str, owner: str):
+    return job_service.delete_job_folder(folder_id, owner)
+
+
+def move_job_to_folder(job_id: str, owner: str, folder_id: str | None):
+    return job_service.move_job_to_folder(job_id, owner, folder_id)
+
+
+def archive_job(job_id: str, owner: str):
+    return job_service.archive_job(job_id, owner)
+
+
+def restore_archived_job(job_id: str, owner: str):
+    return job_service.restore_archived_job(job_id, owner)
+
 def get_file_logs(job_id: str):
     return job_service.get_file_logs(job_id)
 
