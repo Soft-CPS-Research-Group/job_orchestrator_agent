@@ -1833,10 +1833,13 @@ def _deucalion_profile_limits() -> dict[str, int]:
 
 def _host_active_count(host: str) -> int:
     total = 0
-    for job in jobs.values():
+    for job_id, job in jobs.items():
         if job.get("target_host") != host:
             continue
-        if job.get("status") in CAPACITY_COUNT_STATUSES:
+        status = job.get("status")
+        if status in CAPACITY_COUNT_STATUSES:
+            status = _read_status_file(job_id) or status
+        if status in CAPACITY_COUNT_STATUSES:
             total += 1
     return total
 
@@ -1846,7 +1849,10 @@ def _active_job_ids_for_host(host: str) -> list[str]:
     for job_id, meta in jobs.items():
         if meta.get("target_host") != host:
             continue
-        if meta.get("status") not in ACTIVE_JOB_STATUSES:
+        status = meta.get("status")
+        if status in ACTIVE_JOB_STATUSES:
+            status = _read_status_file(job_id) or status
+        if status not in ACTIVE_JOB_STATUSES:
             continue
         updated = _ensure_float(meta.get("last_status_at")) or _ensure_float(meta.get("status_updated_at")) or 0.0
         active.append((job_id, updated))
@@ -1860,7 +1866,10 @@ def _deucalion_active_job_ids_by_profile() -> dict[str, list[str]]:
         host = meta.get("target_host") or meta.get("preferred_host")
         if host != "deucalion":
             continue
-        if meta.get("status") not in ACTIVE_JOB_STATUSES:
+        status = meta.get("status")
+        if status in ACTIVE_JOB_STATUSES:
+            status = _read_status_file(job_id) or status
+        if status not in ACTIVE_JOB_STATUSES:
             continue
         profile = _deucalion_job_profile(job_id, meta)
         updated = _ensure_float(meta.get("last_status_at")) or _ensure_float(meta.get("status_updated_at")) or 0.0

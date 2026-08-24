@@ -845,6 +845,36 @@ def test_hosts_include_active_job_ids_and_current_job(api_client, monkeypatch):
     assert isinstance(row["info"]["last_status_at"], (int, float))
 
 
+def test_hosts_do_not_count_terminal_status_file_from_stale_active_metadata(api_client, monkeypatch):
+    from app.config import settings
+    from app.services import job_service
+
+    monkeypatch.setattr(settings, "AVAILABLE_HOSTS", ["worker-a"])
+    response = api_client.post(
+        "/run-simulation",
+        json={
+            "config": {"experiment": {"name": "Hosts", "run_name": "Terminal"}},
+            "target_host": "worker-a",
+        },
+    )
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+    assert job_service.agent_next_job("worker-a") is not None
+
+    stale_meta = dict(job_service.jobs[job_id])
+    stale_meta["status"] = "recovering"
+    job_service.job_utils.save_job(job_id, stale_meta)
+    job_service.jobs[job_id] = stale_meta
+    job_service.job_utils.write_status_file(job_id, "finished")
+
+    hosts = api_client.get("/hosts").json()["hosts"]
+    row = hosts["worker-a"]
+    assert row["running"] == 0
+    assert row["active_job_ids"] == []
+    assert row["current_job_id"] is None
+    assert row["current_job_status"] is None
+
+
 def test_deucalion_partitions_endpoint(api_client):
     resp = api_client.get("/deucalion/partitions")
     assert resp.status_code == 200
