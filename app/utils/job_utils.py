@@ -53,6 +53,8 @@ def _write_job_track_unlocked(jobs: dict) -> None:
 def ensure_directories():
     if sql_store.enabled():
         sql_store.initialize()
+        if os.path.exists(settings.JOB_TRACK_FILE) and _read_job_track_unlocked() and not sql_store.load_jobs():
+            raise RuntimeError("SQL registry is empty but legacy jobs exist; run the migration before starting")
     os.makedirs(settings.CONFIGS_DIR, exist_ok=True)
     os.makedirs(settings.JOBS_DIR, exist_ok=True)
     os.makedirs(settings.DATASETS_DIR, exist_ok=True)

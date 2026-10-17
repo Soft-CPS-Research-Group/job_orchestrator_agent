@@ -41,3 +41,16 @@ def test_import_is_idempotent_and_refuses_conflicts(sql):
     job_utils.save_job('a',{'status':'running'})
     with pytest.raises(ValueError,match='Conflicting'):migrate(sql,True)
     assert job_utils.load_jobs()['a']['status']=='running'
+
+
+def test_sql_failure_never_falls_back_to_stale_memory(sql,monkeypatch):
+    from app.services import job_service
+    def unavailable():raise ConnectionError('database unavailable')
+    monkeypatch.setattr(job_utils,'load_jobs',unavailable)
+    with pytest.raises(ConnectionError):job_service._refresh_jobs()
+
+
+def test_empty_sql_requires_explicit_legacy_migration(sql,monkeypatch):
+    path=sql/'job_track.json';path.write_text('{"old-job": {"status": "finished"}}')
+    monkeypatch.setattr(settings,'JOB_TRACK_FILE',str(path))
+    with pytest.raises(RuntimeError,match='run the migration'):job_utils.ensure_directories()

@@ -36,6 +36,8 @@ def _parse_cors_allowed_origins(value: Any) -> list[str]:
 
 class Settings(BaseSettings):
     VM_SHARED_DATA: str = "/opt/opeva_shared_data"
+    # Docker daemon host path may differ from the orchestrator's mount path.
+    WORKER_SHARED_DATA_HOST: str | None = None
 
     CONFIGS_DIR: str = os.path.join(VM_SHARED_DATA, "configs")
     JOB_DATABASE_URL: str | None = None

@@ -287,6 +287,8 @@ def _refresh_jobs():
             jobs.update(disk_jobs)
     except Exception:
         _LOGGER.warning("Failed to refresh jobs registry from disk", exc_info=True)
+        if sql_store.enabled():
+            raise
 
 
 def _persist_job(job_id: str, metadata: dict):
@@ -4243,7 +4245,7 @@ def _dispatch_claimed_job(
         "command": command,
         "container_name": container_name,
         "volumes": [{
-            "host": settings.VM_SHARED_DATA,
+            "host": settings.WORKER_SHARED_DATA_HOST or settings.VM_SHARED_DATA,
             "container": "/data",
             "mode": "rw",
         }],

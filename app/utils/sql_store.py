@@ -33,8 +33,13 @@ def upsert(c,table,values,key):
     c.execute(stmt.on_conflict_do_update(index_elements=[key],set_={k:getattr(stmt.excluded,k) for k in values if k!=key}))
 
 def initialize():
-    metadata.create_all(engine())
-    with engine().begin() as c:
+    _initialize(settings.JOB_DATABASE_URL)
+
+@lru_cache(maxsize=4)
+def _initialize(url):
+    db = _engine(url)
+    metadata.create_all(db)
+    with db.begin() as c:
         insert=pg_insert if c.dialect.name=='postgresql' else sqlite_insert
         c.execute(insert(schema).values(version=1).on_conflict_do_nothing())
         c.execute(insert(organization).values(id='personal',payload={'schema_version':1,'folders':{},'jobs':{}}).on_conflict_do_nothing())

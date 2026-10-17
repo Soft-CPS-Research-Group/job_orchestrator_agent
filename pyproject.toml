@@ -1,6 +1,6 @@
 [project]
 name = "job-orchestrator-agent"
-version = "1.1.0"
+version = "1.1.1"
 description = "OPEVA job orchestration API for worker-dispatched simulation jobs"
 authors = [
     {name = "OPEVA Team"}
