@@ -51,8 +51,8 @@ def stop_job(job_id: str, reason: str = "ops_stop"):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-def cleanup_queue(force: bool = False):
-    return job_service.ops_cleanup_queue(force)
+def cleanup_queue(force: bool = False, workspace_id: str | None = None):
+    return job_service.ops_cleanup_queue(force,workspace_id)
 
 
 def cleanup_jobs(keep: list[str] | None = None):

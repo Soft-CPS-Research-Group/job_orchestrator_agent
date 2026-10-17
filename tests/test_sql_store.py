@@ -66,3 +66,15 @@ def test_workspace_listing_reads_registry_once(sql,monkeypatch):
     monkeypatch.setattr(job_service,'_mark_stale_jobs',lambda:None)
     assert [j['job_id'] for j in job_service.list_jobs('community:one')]==['two']
     assert len(calls)==1
+
+
+def test_scoped_sql_queue_cleanup_preserves_other_workspaces_and_live_claims(sql,monkeypatch):
+    from app.services import job_service
+    for jid,wid,status in [('own','community:one','finished'),('foreign','community:two','finished'),('waiting','community:one','queued'),('claimed','community:one','finished')]:
+        job_utils.save_job(jid,{'workspace_id':wid,'status':status});job_utils.enqueue_job({'job_id':jid})
+    with sql_store.engine().begin() as c:
+        c.execute(sql_store.queue.update().where(sql_store.queue.c.job_id=='claimed').values(claimed_by='worker',claimed_at=time.time()))
+    monkeypatch.setattr(job_service,'_read_status_file',lambda _:None)
+    assert job_service.ops_cleanup_queue(False,'community:one')['removed']==['own']
+    with sql_store.engine().connect() as c:
+        assert set(c.scalars(sql_store.select(sql_store.queue.c.job_id)))=={'foreign','waiting','claimed'}

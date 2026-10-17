@@ -40,8 +40,8 @@ def stop_job(job_id: str, reason: str = Body("ops_stop", embed=True)):
 
 
 @router.post("/ops/queue/cleanup")
-def cleanup_queue(force: bool = Body(False, embed=True)):
-    return ops_controller.cleanup_queue(force)
+def cleanup_queue(force: bool = Body(False), workspace_id: str | None = Body(None)):
+    return ops_controller.cleanup_queue(force,workspace_id)
 
 
 @router.post("/ops/jobs/cleanup")

@@ -4004,9 +4004,17 @@ def ops_stop_job(job_id: str, reason: str = "ops_stop"):
     return response
 
 
-def ops_cleanup_queue(force: bool = False) -> dict:
+def ops_cleanup_queue(force: bool = False, workspace_id: str | None = None) -> dict:
     _refresh_jobs()
     removed: list[str] = []
+    if sql_store.enabled():
+        for entry in sql_store.list_queue():
+            jid=entry['job_id'];meta=jobs.get(jid,{})
+            if workspace_id is not None and (meta.get('workspace_id') or 'laboratory')!=workspace_id:continue
+            status_now=_read_status_file(jid) or meta.get('status')
+            if force or not meta or status_now not in (JobStatus.QUEUED.value,JobStatus.LAUNCHING.value):
+                if sql_store.remove_queue(jid):removed.append(jid)
+        return {'removed':removed,'count':len(removed)}
     wdir = settings.QUEUE_DIR
     if not os.path.isdir(wdir):
         return {"removed": removed, "count": 0}
@@ -4022,6 +4030,8 @@ def ops_cleanup_queue(force: bool = False) -> dict:
                 job_id = fname.split(".json.claim.", 1)[0]
             else:
                 job_id = fname
+            if workspace_id is not None and (jobs.get(job_id,{}).get('workspace_id') or 'laboratory')!=workspace_id:
+                continue
             try:
                 os.remove(path)
                 removed_set.add(job_id)
@@ -4042,6 +4052,7 @@ def ops_cleanup_queue(force: bool = False) -> dict:
             continue
         job_id = payload.get("job_id") or fname.rsplit(".", 1)[0]
         meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {})
+        if workspace_id is not None and (meta.get('workspace_id') or 'laboratory')!=workspace_id:continue
         status_now = _read_status_file(job_id) or meta.get("status")
         if not meta or status_now not in (JobStatus.QUEUED.value, JobStatus.LAUNCHING.value):
             try:

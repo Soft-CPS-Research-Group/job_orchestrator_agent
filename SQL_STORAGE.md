@@ -25,3 +25,9 @@ not a safe rollback after new SQL executions without exporting/reconciling state
 Job listings refresh the registry once per request, not once per job. The optional
 workspace_id query avoids loading unrelated job artefact files into community views.
 205 tests passed, including a guard against repeated full-registry reads.
+
+## 1.1.3 — scoped queue maintenance
+
+Queue cleanup supports PostgreSQL and an optional workspace_id. It retains live
+claims and jobs belonging to other workspaces. JSON mode remains supported. The
+full suite, including PostgreSQL concurrency checks, passes 206 tests.
