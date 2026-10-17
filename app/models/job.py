@@ -21,6 +21,8 @@ class DeucalionRunOptions(BaseModel):
 class JobLaunchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    workspace_id: Optional[str] = Field(default=None, max_length=100)
+    training_context: Optional[Dict] = None
     config: Optional[Dict] = None
     config_path: Optional[str] = None
     target_host: Optional[str] = None

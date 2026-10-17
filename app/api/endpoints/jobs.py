@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Header
 from fastapi.responses import StreamingResponse
 from app.controllers import job_controller
 from app.models.job import (
@@ -12,7 +12,12 @@ from app.models.job import (
 router = APIRouter()
 
 @router.post("/run-simulation")
-async def run_sim(request: JobLaunchRequest):
+async def run_sim(request: JobLaunchRequest, x_training_token: str | None = Header(None)):
+    from app.config import settings
+    import hmac
+    if request.workspace_id and request.workspace_id != "laboratory" and settings.TRAINING_SERVICE_TOKEN:
+        if not hmac.compare_digest(x_training_token or "", settings.TRAINING_SERVICE_TOKEN):
+            raise HTTPException(403, "Scoped submissions require the Training service")
     return await job_controller.run_simulation(request)
 
 @router.get("/status/{job_id}")

@@ -14,7 +14,7 @@ from urllib import error as urllib_error
 from app.config import settings
 from app.models.job import JobLaunchRequest
 from app.services import email_notification_service, job_organization_service
-from app.utils import job_utils, file_utils
+from app.utils import job_utils, file_utils, sql_store
 from app.status import JobStatus, can_transition
 
 # In-memory cache of tracked jobs for fast access and testability
@@ -3042,10 +3042,12 @@ async def launch_simulation(request: JobLaunchRequest):
         config_path = f"configs/{config_path}"
 
     os.makedirs(_log_dir(job_id), exist_ok=True)
-    if runtime_config_changed:
-        _write_resolved_config(job_id, runtime_config)
+    # Every job pins its exact resolved configuration, even when paths are unchanged.
+    _write_resolved_config(job_id, runtime_config)
     meta = {
         "job_id": job_id,
+        "workspace_id": request.workspace_id or "laboratory",
+        "training_context": request.training_context or {},
         "job_name": job_name,
         "config_path": config_path,
         "target_host": preferred_host,
@@ -3076,6 +3078,14 @@ async def launch_simulation(request: JobLaunchRequest):
         deucalion_options=deucalion_options,
         target_worker_profile=target_worker_profile,
     )
+    info_path = _info_path(job_id)
+    launch_info = {}
+    if os.path.exists(info_path):
+        with open(info_path) as handle:
+            launch_info = json.load(handle)
+    launch_info.update(workspace_id=meta["workspace_id"], training_context=meta["training_context"])
+    with open(info_path, "w") as handle:
+        json.dump(launch_info, handle, indent=2)
     _write_status(
         job_id,
         JobStatus.LAUNCHING.value,
@@ -4130,7 +4140,7 @@ def ops_cleanup_jobs(keep: list[str] | None = None) -> dict:
 
 # ---------- hooks used by agent endpoints ----------
 def agent_next_job(worker_id: str, capabilities: list[str] | None = None):
-    with _dispatch_lock(worker_id):
+    with sql_store.advisory_lock("dispatch:" + worker_id), _dispatch_lock(worker_id):
         return _agent_next_job_locked(worker_id, capabilities=capabilities)
 
 
@@ -4158,12 +4168,18 @@ def _agent_next_job_locked(worker_id: str, capabilities: list[str] | None = None
         return None
 
     job_id = job_queue_entry["job_id"]
-    with _job_state_lock(job_id):
-        return _dispatch_claimed_job(
-            worker_id,
-            job_queue_entry,
-            supports_attempt_fencing=supports_attempt_fencing,
-        )
+    try:
+        with _job_state_lock(job_id):
+            result = _dispatch_claimed_job(
+                worker_id, job_queue_entry, supports_attempt_fencing=supports_attempt_fencing,
+            )
+        if sql_store.enabled():
+            sql_store.remove_queue(job_id)
+        return result
+    except Exception:
+        if sql_store.enabled():
+            sql_store.release(job_id)
+        raise
 
 
 def _dispatch_claimed_job(

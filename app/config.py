@@ -38,6 +38,8 @@ class Settings(BaseSettings):
     VM_SHARED_DATA: str = "/opt/opeva_shared_data"
 
     CONFIGS_DIR: str = os.path.join(VM_SHARED_DATA, "configs")
+    JOB_DATABASE_URL: str | None = None
+    TRAINING_SERVICE_TOKEN: str | None = None
     JOB_TRACK_FILE: str = os.path.join(VM_SHARED_DATA, "job_track.json")
     JOBS_DIR: str = os.path.join(VM_SHARED_DATA, "jobs")
     DATASETS_DIR: str = os.path.join(VM_SHARED_DATA, "datasets")

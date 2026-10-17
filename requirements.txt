@@ -11,3 +11,6 @@ pyarrow>=18,<23
 python-multipart
 uvicorn
 pytest>=7.0
+
+SQLAlchemy==2.0.49
+psycopg2-binary==2.9.11

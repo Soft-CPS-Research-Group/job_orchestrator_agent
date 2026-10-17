@@ -4,6 +4,7 @@ import fcntl
 from contextlib import contextmanager
 from typing import Callable
 from app.config import settings
+from app.utils import sql_store
 
 @contextmanager
 def _job_track_lock():
@@ -50,21 +51,28 @@ def _write_job_track_unlocked(jobs: dict) -> None:
 
 
 def ensure_directories():
+    if sql_store.enabled():
+        sql_store.initialize()
     os.makedirs(settings.CONFIGS_DIR, exist_ok=True)
     os.makedirs(settings.JOBS_DIR, exist_ok=True)
     os.makedirs(settings.DATASETS_DIR, exist_ok=True)
     os.makedirs(settings.QUEUE_DIR, exist_ok=True)
-    if not os.path.exists(settings.JOB_TRACK_FILE):
+    if not sql_store.enabled() and not os.path.exists(settings.JOB_TRACK_FILE):
         with _job_track_lock():
             _write_job_track_unlocked({})
 
 def load_jobs():
+    if sql_store.enabled():
+        sql_store.initialize()
+        return sql_store.load_jobs()
     if not os.path.exists(settings.JOB_TRACK_FILE):
         return {}
     with _job_track_lock():
         return _read_job_track_unlocked()
 
 def save_job(job_id, metadata):
+    if sql_store.enabled():
+        return sql_store.save_job(job_id, metadata)
     with _job_track_lock():
         jobs = _read_job_track_unlocked()
         jobs[job_id] = metadata
@@ -162,6 +170,8 @@ def delete_job_by_id(job_id: str) -> bool:
             except OSError:
                 return False
 
+    if sql_store.enabled():
+        return sql_store.delete_job(job_id) or removed_fs
     removed_registry = False
     with _job_track_lock():
         jobs = _read_job_track_unlocked()
@@ -174,6 +184,8 @@ def delete_job_by_id(job_id: str) -> bool:
 
 def prune_jobs(keep: set[str]) -> list[str]:
     """Remove all job records from the registry except those in keep."""
+    if sql_store.enabled():
+        return sql_store.prune_jobs(keep)
     removed: list[str] = []
     with _job_track_lock():
         jobs = _read_job_track_unlocked()
@@ -197,6 +209,8 @@ def _queue_path(job_id: str) -> str:
 
 
 def enqueue_job(payload: dict):
+    if sql_store.enabled():
+        return sql_store.enqueue(payload)
     os.makedirs(settings.QUEUE_DIR, exist_ok=True)
     path = _queue_path(payload["job_id"])
     entry = {
@@ -233,6 +247,8 @@ def _restore_stale_claims(ttl: int):
 
 
 def agent_pop_next_job(worker_id: str, can_accept: Callable[[dict], bool] | None = None) -> dict | None:
+    if sql_store.enabled():
+        return sql_store.claim(worker_id, can_accept)
     wdir = settings.QUEUE_DIR
     if not os.path.isdir(wdir):
         return None
@@ -293,6 +309,8 @@ def agent_pop_next_job(worker_id: str, can_accept: Callable[[dict], bool] | None
 
 def list_queue() -> list[dict]:
     """Return pending queue entries ordered by enqueue time."""
+    if sql_store.enabled():
+        return sql_store.list_queue()
     wdir = settings.QUEUE_DIR
     if not os.path.isdir(wdir):
         return []
@@ -315,6 +333,8 @@ def list_queue() -> list[dict]:
 
 
 def remove_from_queue(job_id: str) -> bool:
+    if sql_store.enabled():
+        return sql_store.remove_queue(job_id)
     removed = False
     path = _queue_path(job_id)
     if os.path.exists(path):

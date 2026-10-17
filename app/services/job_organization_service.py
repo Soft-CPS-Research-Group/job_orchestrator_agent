@@ -11,6 +11,7 @@ from typing import Any, Iterator
 from uuid import uuid4
 
 from app.config import settings
+from app.utils import sql_store
 
 
 SCHEMA_VERSION = 1
@@ -63,6 +64,10 @@ def _write_unlocked(path: Path, payload: dict[str, Any]) -> None:
 
 @contextmanager
 def _locked_store(*, write: bool) -> Iterator[dict[str, Any]]:
+    if sql_store.enabled():
+        with sql_store.organization_store(write) as store:
+            yield store
+        return
     path = _store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = path.with_suffix(f"{path.suffix}.lock")

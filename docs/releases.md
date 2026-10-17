@@ -146,3 +146,12 @@ First stable release of the standalone OPEVA Job Orchestrator service. The servi
 - Update frontend/API clients from `http://<host>:8000` to `http://<host>:8011` for jobs, configs, datasets and simulation data.
 - Update worker deployments to `OPEVA_SERVER=http://job_orchestrator_agent:8011`.
 - Keep `/opt/opeva_shared_data` mounted at the same path in the orchestrator and all workers.
+
+## 1.1.0 — AI Training candidate
+
+- Optional PostgreSQL job registry, organization and leased queue (`JOB_DATABASE_URL`).
+- Workspace and training provenance retained without changing worker payload requirements.
+- Every job retains its resolved configuration snapshot.
+- Explicit idempotent JSON-to-SQL migration with dry-run and conflict checks.
+- Existing file storage remains the default until an operator completes migration.
+- Validation: 201 tests passed, including queue reservation/recovery and migration conflicts.
