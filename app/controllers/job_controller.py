@@ -29,8 +29,8 @@ def get_logs_chunk(job_id: str, offset: int | None = None, tail_lines: int = 200
 def stop_job(job_id: str):
     return job_service.stop_job(job_id)
 
-def list_jobs():
-    return job_service.list_jobs()
+def list_jobs(workspace_id: str | None = None):
+    return job_service.list_jobs(workspace_id)
 
 
 def list_queue():

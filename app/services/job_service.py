@@ -3337,14 +3337,15 @@ def stop_job(job_id: str, reason: str = "stop_requested", requested_by_ops: bool
 
     return {"message": f"Job is {status_now}; nothing to stop"}
 
-def list_jobs():
+def list_jobs(workspace_id: str | None = None):
     _refresh_jobs()
     _mark_stale_jobs()
     queue_entries = job_utils.list_queue()
     queued_start_estimates = _queued_start_estimates(queue_entries)
     result = []
-    organizations = job_organization_service.get_job_organizations(list(jobs))
-    for job_id, job in jobs.items():
+    selected = {jid: job for jid, job in jobs.items() if workspace_id is None or (job.get('workspace_id') or 'laboratory') == workspace_id}
+    organizations = job_organization_service.get_job_organizations(list(selected))
+    for job_id, job in selected.items():
         merged = dict(job)
         merged["job_id"] = job_id
         info = {}
@@ -3373,7 +3374,9 @@ def list_jobs():
             info["result_storage"] = result_storage
         info = _without_email_notification_metadata(info)
 
-        status_payload = get_status(job_id)
+        # The registry was already refreshed once above. Re-reading it for every
+        # row turns a listing into N full registry/database reads.
+        status_payload = _read_status_payload(job_id) or {'job_id':job_id,'status':job.get('status',JobStatus.UNKNOWN.value)}
         status = status_payload["status"]
         merged["status"] = status
         merged = _normalized_job_meta(job_id, merged, persist=True)

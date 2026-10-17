@@ -54,3 +54,15 @@ def test_empty_sql_requires_explicit_legacy_migration(sql,monkeypatch):
     path=sql/'job_track.json';path.write_text('{"old-job": {"status": "finished"}}')
     monkeypatch.setattr(settings,'JOB_TRACK_FILE',str(path))
     with pytest.raises(RuntimeError,match='run the migration'):job_utils.ensure_directories()
+
+
+def test_workspace_listing_reads_registry_once(sql,monkeypatch):
+    from app.services import job_service
+    for jid,wid in [('one','laboratory'),('two','community:one')]:
+        job_utils.save_job(jid,{'status':'finished','workspace_id':wid})
+    calls=[];original=job_utils.load_jobs
+    def counted():calls.append(True);return original()
+    monkeypatch.setattr(job_utils,'load_jobs',counted)
+    monkeypatch.setattr(job_service,'_mark_stale_jobs',lambda:None)
+    assert [j['job_id'] for j in job_service.list_jobs('community:one')]==['two']
+    assert len(calls)==1

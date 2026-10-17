@@ -50,8 +50,8 @@ async def stop_job(job_id: str):
     return job_controller.stop_job(job_id)
 
 @router.get("/jobs")
-async def list_jobs():
-    return job_controller.list_jobs()
+async def list_jobs(workspace_id: str | None = None):
+    return job_controller.list_jobs(workspace_id)
 
 
 @router.get("/queue")

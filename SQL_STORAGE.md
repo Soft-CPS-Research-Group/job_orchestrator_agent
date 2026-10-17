@@ -19,3 +19,9 @@ Tests: 204 passed, including a real PostgreSQL test with 30 jobs and five concur
 claimants, no duplicate claims, and persistence after reconnect. Production cutover
 must quiesce submission/dispatch and reconcile active jobs; an old JSON snapshot is
 not a safe rollback after new SQL executions without exporting/reconciling state.
+
+## 1.1.2 — listing performance
+
+Job listings refresh the registry once per request, not once per job. The optional
+workspace_id query avoids loading unrelated job artefact files into community views.
+205 tests passed, including a guard against repeated full-registry reads.
