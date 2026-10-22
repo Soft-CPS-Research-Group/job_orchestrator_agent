@@ -226,6 +226,8 @@ def list_available_datasets():
         return datasets
 
     for name in os.listdir(settings.DATASETS_DIR):
+        if name.startswith('.') or name == 'communities':
+            continue
         path = os.path.join(settings.DATASETS_DIR, name)
         if not os.path.exists(path):
             continue

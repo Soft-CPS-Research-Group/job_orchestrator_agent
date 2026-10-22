@@ -138,3 +138,11 @@ def test_upload_dataset_archive_rejects_unsafe_paths(dataset_env):
 
     with pytest.raises(ValueError):
         file_utils.upload_dataset_archive(payload, "unsafe.zip", "unsafe_ds")
+
+
+def test_internal_community_storage_is_not_a_legacy_dataset(dataset_env):
+    file_utils, settings = dataset_env
+    root=Path(settings.DATASETS_DIR)
+    for name in ('communities','.staging','.mirror-pending','ds_immutable'):
+        (root/name).mkdir(parents=True)
+    assert [item['name'] for item in file_utils.list_available_datasets()]==['ds_immutable']
