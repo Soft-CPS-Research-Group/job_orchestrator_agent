@@ -59,7 +59,8 @@ ALLOWED_TRANSITIONS = {
         JobStatus.STOPPED,
         JobStatus.CANCELED,
     },
-    JobStatus.STOP_REQUESTED: {JobStatus.STOPPED, JobStatus.FAILED, JobStatus.CANCELED},
+    # The current attempt may finish before its worker observes the stop request.
+    JobStatus.STOP_REQUESTED: {JobStatus.STOPPED, JobStatus.FAILED, JobStatus.CANCELED, JobStatus.FINISHED},
     JobStatus.FINISHED: set(),
     JobStatus.FAILED: set(),
     JobStatus.STOPPED: set(),

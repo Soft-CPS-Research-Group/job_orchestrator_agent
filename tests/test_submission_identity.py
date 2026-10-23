@@ -1,7 +1,8 @@
 import asyncio
 import os
+import threading
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 
 import pytest
 from fastapi import HTTPException
@@ -116,6 +117,66 @@ def test_attempt_preparation_can_resume_before_dispatch_is_committed():
     jid=launch()['job_id']
     first=attempt_artifacts.prepare(jid,1)
     assert attempt_artifacts.prepare(jid,1)==first
+
+
+def running_job():
+    jid = launch()['job_id']
+    dispatched = job_service.agent_next_job('server', [job_service.ATTEMPT_FENCING_CAPABILITY])
+    fence = {'worker_id': 'server', 'attempt_number': dispatched['attempt_number'],
+             'attempt_token': dispatched['attempt_token']}
+    job_service.agent_update_status(jid, 'running', fence)
+    return jid, fence
+
+
+@pytest.mark.parametrize('terminal', ['stopped', 'finished', 'failed', 'canceled'])
+def test_stop_survives_delayed_active_reports_and_accepts_completion(terminal):
+    jid, fence = running_job()
+    job_service.ops_stop_job(jid, reason='operator stop')
+    requested_at = job_utils.load_jobs()[jid]['stop_requested_at']
+    for delayed in ['running', 'setup', 'recovering']:
+        assert job_service.agent_update_status(jid, delayed, {**fence, 'container_id': 'cid'}) == {'ok': True}
+        persisted = job_utils.load_jobs()[jid]
+        assert job_service.get_status(jid)['status'] == 'stop_requested'
+        assert persisted['stop_reason'] == 'operator stop'
+        assert persisted['stopped_by_ops'] is True
+        assert persisted['stop_requested_at'] == requested_at
+        assert persisted['container_id'] == 'cid'
+    job_service.agent_update_status(jid, terminal, fence)
+    assert job_service.get_status(jid)['status'] == terminal
+
+
+def test_stop_waits_for_inflight_heartbeat_write(monkeypatch):
+    jid, fence = running_job()
+    write_started, allow_write, stop_started = (threading.Event() for _ in range(3))
+    write = job_utils.write_status_file
+
+    def held_write(job_id, status, extra):
+        if status == 'running':
+            write_started.set()
+            assert allow_write.wait(5)
+        return write(job_id, status, extra)
+
+    def stop():
+        stop_started.set()
+        return job_service.ops_stop_job(jid, reason='concurrent stop')
+
+    monkeypatch.setattr(job_utils, 'write_status_file', held_write)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        heartbeat = pool.submit(job_service.agent_update_status, jid, 'running', fence)
+        try:
+            assert write_started.wait(5)
+            stopping = pool.submit(stop)
+            assert stop_started.wait(5)
+            # The stop must wait for the pending status write to commit.
+            with pytest.raises(TimeoutError):
+                stopping.result(timeout=.2)
+        finally:
+            allow_write.set()
+        heartbeat.result(timeout=5)
+        stopping.result(timeout=5)
+    assert job_service.get_status(jid)['status'] == 'stop_requested'
+    job_service.agent_update_status(jid, 'stopped', fence)
+    assert job_service.get_status(jid)['status'] == 'stopped'
 
 
 def test_training_context_reaches_runtime_config_without_mutating_source():

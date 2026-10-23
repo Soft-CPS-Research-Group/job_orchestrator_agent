@@ -66,6 +66,17 @@ Release owner: [@calofonseca](https://github.com/calofonseca).
 - ...
 ```
 
+## v1.3.1 - 2026-10-23
+
+- Serializes operator stop requests with worker status updates. A heartbeat
+  already in flight cannot overwrite the stop request; subsequent active reports
+  retain the original stop reason and request timestamp until the worker stops.
+- Accepts a valid completion from the current attempt if it finished before
+  observing the stop request. Attempt fencing still rejects revoked workers.
+- Adds regression coverage for concurrent stop/heartbeat writes and delayed
+  updates with file, SQLite and opt-in PostgreSQL storage.
+- No database migration, volume change or worker upgrade is required for this fix.
+
 ## v1.3.0 - 2026-10-23
 
 - Carries frozen training provenance into the runtime config through the existing

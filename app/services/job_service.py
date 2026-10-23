@@ -3335,6 +3335,13 @@ def get_logs_chunk(
 
 # ---------- API: stop/list/info/delete/hosts ----------
 def stop_job(job_id: str, reason: str = "stop_requested", requested_by_ops: bool = False):
+    if not _job_exists(job_id):
+        raise HTTPException(404, "Job not found")
+    with _job_state_lock(job_id):
+        return _stop_job_locked(job_id, reason, requested_by_ops)
+
+
+def _stop_job_locked(job_id: str, reason: str, requested_by_ops: bool):
     _refresh_jobs()
     job = jobs.get(job_id)
     if not job:
@@ -4412,6 +4419,15 @@ def _agent_update_status_locked(job_id: str, status: str, extra: dict | None = N
         raise HTTPException(400, f"Unknown status '{status}'")
     meta = jobs.get(job_id) or job_utils.load_jobs().get(job_id, {})
     _validate_agent_attempt(job_id, meta, extra)
+    current = _read_status_payload(job_id) or {}
+    if current.get("status", meta.get("status")) == JobStatus.STOP_REQUESTED.value:
+        # A heartbeat can already be in flight when the operator requests a stop.
+        # Acknowledge it, retaining the stop intent for the worker's next poll.
+        if status in ACTIVE_JOB_STATUSES:
+            status = JobStatus.STOP_REQUESTED.value
+        for key in ("stop_requested", "stop_reason", "stopped_by_ops", "stop_requested_at"):
+            if key in current or key in meta:
+                extra[key] = current.get(key, meta.get(key))
     _LOGGER.info(
         "Agent reported status for job %s: %s (extra keys=%s)",
         job_id,
