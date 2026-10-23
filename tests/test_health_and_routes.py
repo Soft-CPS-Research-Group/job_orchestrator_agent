@@ -22,7 +22,7 @@ def test_health_endpoint(monkeypatch, tmp_path):
 
 
 def test_app_version_metadata():
-    assert __version__ == "1.1.3"
+    assert __version__ == "1.3.0"
     assert app.version == __version__
 
 

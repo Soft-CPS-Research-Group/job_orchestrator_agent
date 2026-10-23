@@ -1916,12 +1916,15 @@ def _can_dispatch_to_worker(
     *,
     deucalion_active_counts: dict[str, int] | None = None,
     supports_attempt_fencing: bool = False,
+    supports_artifact_isolation: bool = False,
 ) -> bool:
     job_id = queue_payload.get("job_id")
     if not isinstance(job_id, str) or not job_id:
         return True
 
     meta = jobs.get(job_id) or {}
+    if meta.get('artifact_isolation_enabled') and not supports_artifact_isolation:
+        return False
     if meta.get("attempt_fencing_enabled") is True and not supports_attempt_fencing:
         _LOGGER.info(
             "Legacy worker %s cannot accept fenced job %s; keeping it queued",
@@ -3082,6 +3085,10 @@ async def _launch_simulation(request: JobLaunchRequest, job_id: str | None = Non
         config_path = f"configs/{config_path}"
 
     os.makedirs(_log_dir(job_id), exist_ok=True)
+    if request.training_context:
+        provenance = {k: v for k, v in request.training_context.items() if k != "configuration"}
+        provenance.update(job_id=job_id, workspace_id=request.workspace_id or "laboratory")
+        runtime_config.setdefault("tracking", {}).setdefault("tags", {})["energaize_training"] = provenance
     # Every job pins its exact resolved configuration, even when paths are unchanged.
     _write_resolved_config(job_id, runtime_config)
     meta = {
@@ -4207,6 +4214,8 @@ def _agent_next_job_locked(worker_id: str, capabilities: list[str] | None = None
         if str(capability).strip()
     }
     supports_attempt_fencing = ATTEMPT_FENCING_CAPABILITY in worker_capabilities
+    from app.utils import attempt_artifacts
+    supports_artifact_isolation = supports_attempt_fencing and attempt_artifacts.CAPABILITY in worker_capabilities
     deucalion_active_counts = _deucalion_active_counts_by_profile() if worker_id == "deucalion" else None
     job_queue_entry = job_utils.agent_pop_next_job(
         worker_id,
@@ -4215,6 +4224,7 @@ def _agent_next_job_locked(worker_id: str, capabilities: list[str] | None = None
             payload,
             deucalion_active_counts=deucalion_active_counts,
             supports_attempt_fencing=supports_attempt_fencing,
+            supports_artifact_isolation=supports_artifact_isolation,
         ),
     )
     if not job_queue_entry:
@@ -4226,6 +4236,7 @@ def _agent_next_job_locked(worker_id: str, capabilities: list[str] | None = None
         with _job_state_lock(job_id):
             result = _dispatch_claimed_job(
                 worker_id, job_queue_entry, supports_attempt_fencing=supports_attempt_fencing,
+                supports_artifact_isolation=supports_artifact_isolation,
             )
         if sql_store.enabled():
             sql_store.remove_queue(job_id)
@@ -4241,6 +4252,7 @@ def _dispatch_claimed_job(
     job_queue_entry: dict,
     *,
     supports_attempt_fencing: bool,
+    supports_artifact_isolation: bool = False,
 ):
     job_id = job_queue_entry["job_id"]
     _refresh_jobs()
@@ -4308,6 +4320,15 @@ def _dispatch_claimed_job(
     if attempt_token is not None:
         response["attempt_token"] = attempt_token
         response["attempt_protocol"] = ATTEMPT_FENCING_CAPABILITY
+    if supports_artifact_isolation and (next_attempt_number == 1 or meta.get('artifact_isolation_enabled')):
+        from app.utils import attempt_artifacts
+        artifacts = attempt_artifacts.prepare(job_id, next_attempt_number)
+        response['artifact_job_dir'] = artifacts['job_dir']
+        response['artifact_protocol'] = attempt_artifacts.CAPABILITY
+        response['config_path'] = artifacts['job_dir'] + '/config.resolved.yaml'
+        response['command'] = f"--config /data/{response['config_path']} --job_id {job_id} --base-dir /data/{artifacts['base']}"
+        meta['artifact_isolation_enabled'] = True
+        meta['artifact_job_dir'] = artifacts['job_dir']
     if worker_id == "deucalion":
         deucalion_tracking_uri = str(settings.DEUCALION_MLFLOW_TRACKING_URI or "").strip()
         if deucalion_tracking_uri:

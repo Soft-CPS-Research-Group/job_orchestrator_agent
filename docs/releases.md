@@ -66,6 +66,23 @@ Release owner: [@calofonseca](https://github.com/calofonseca).
 - ...
 ```
 
+## v1.3.0 - 2026-10-23
+
+- Carries frozen training provenance into the runtime config through the existing
+  tracking tags contract, including the logical job and execution attempt.
+- Negotiates `attempt_artifacts_v1` with Docker workers (0.6.0+). Each new job's
+  attempts write under `jobs/<id>/.attempts/<n>/jobs/<id>`. Relative symlinks keep
+  the existing artifact API paths working while revoked writers retain only their
+  own attempt's directory. Prior attempts and the submitted config are retained.
+- Jobs using this capability cannot fall back to a worker lacking it. Jobs first
+  dispatched with older workers keep their existing layout; active historical
+  executions are not rewritten. Union/Deucalion contracts are unchanged.
+- A periodic stale-job sweep runs every 15 seconds (configurable with
+  `STALE_RECONCILIATION_INTERVAL`); existing heartbeat/status grace periods apply.
+- Roll out the orchestrator before worker 0.6.0. Use images whose runner supports
+  the existing `--base-dir` option. Preserve relative symlinks when backing up the
+  complete jobs tree; never delete `.attempts` separately.
+
 ## v1.2.0 - 2026-10-23
 
 - Optional `idempotency_key` on `/run-simulation` makes repeated requests return
