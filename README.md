@@ -123,3 +123,10 @@ pytest
 ```
 
 The GitHub Actions workflow runs tests and builds/pushes Docker images. The default image is `calof/job_orchestrator_agent`; set the `DOCKER_IMAGE_NAME` secret to override it.
+
+### Submission identity (1.2.0)
+
+`POST /run-simulation` accepts an optional `idempotency_key` (8–160 characters).
+Reuse it only for retries of the same logical request. A successful new run needs
+another key. Identity is scoped to workspace and submitter; conflicting parameters
+return 409. The original resolved input survives retries and restarts.

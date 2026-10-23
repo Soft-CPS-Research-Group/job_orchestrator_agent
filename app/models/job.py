@@ -22,6 +22,7 @@ class JobLaunchRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     workspace_id: Optional[str] = Field(default=None, max_length=100)
+    idempotency_key: Optional[str] = Field(default=None, min_length=8, max_length=160)
     training_context: Optional[Dict] = None
     config: Optional[Dict] = None
     config_path: Optional[str] = None

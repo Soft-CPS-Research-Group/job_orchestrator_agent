@@ -2980,6 +2980,44 @@ def _mark_stale_job_locked(job_id: str, meta: dict, now: float) -> None:
 
 
 async def launch_simulation(request: JobLaunchRequest):
+    if not request.idempotency_key:
+        return await _launch_simulation(request)
+    from app.utils import submission_store
+    job_utils.ensure_directories()
+    key = submission_store.identity(request)
+    fingerprint = submission_store.digest(request.model_dump(mode='json', exclude={'idempotency_key'}))
+    with submission_store.locked(key):
+        record = submission_store.read(key)
+        if record and record['fingerprint'] != fingerprint:
+            raise HTTPException(409, 'This submission key already has different parameters')
+        if not record:
+            frozen = request.model_dump(mode='json')
+            if request.config_path:
+                relative = Path(request.config_path.removeprefix('configs/'))
+                root = Path(settings.CONFIGS_DIR).resolve()
+                source = (root / relative).resolve()
+                if not source.is_relative_to(root):
+                    raise HTTPException(400, 'Invalid config_path')
+                frozen.update(config=yaml.safe_load(source.read_text()), config_path=None)
+            record = {'fingerprint': fingerprint, 'job_id': str(uuid4()), 'request': frozen}
+            submission_store.write(key, record)
+        job_id = record['job_id']
+        with _job_state_lock(job_id):
+            _refresh_jobs()
+            previous = jobs.get(job_id)
+            if record.get('response') and not previous:
+                raise HTTPException(410, 'The original job was deleted; use a new submission key for a new run')
+            if previous and previous.get('status') != JobStatus.LAUNCHING.value:
+                result = {k: previous.get(k) for k in ('job_name', 'image_tag', 'image', 'target_worker_profile')}
+                result.update(job_id=job_id, status=previous['status'], host=previous.get('target_host'))
+            else:
+                result = await _launch_simulation(JobLaunchRequest.model_validate(record['request']), job_id=job_id)
+            record['response'] = result
+            submission_store.write(key, record)
+            return result
+
+
+async def _launch_simulation(request: JobLaunchRequest, job_id: str | None = None):
     job_utils.ensure_directories()
 
     if not settings.AVAILABLE_HOSTS:
@@ -2989,7 +3027,7 @@ async def launch_simulation(request: JobLaunchRequest):
     target_worker_profile = _normalize_target_worker_profile(request.target_worker_profile)
     if preferred_host and target_worker_profile:
         raise HTTPException(400, "target_worker_profile is only allowed with automatic host selection")
-    job_id = str(uuid4())
+    job_id = job_id or str(uuid4())
 
     # config
     if request.config_path:

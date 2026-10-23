@@ -66,6 +66,18 @@ Release owner: [@calofonseca](https://github.com/calofonseca).
 - ...
 ```
 
+## v1.2.0 - 2026-10-23
+
+- Optional `idempotency_key` on `/run-simulation` makes repeated requests return
+  the original job, including concurrent requests, restart and a lost response.
+- A durable submission record freezes named configuration contents before launch.
+  Reusing a key with different parameters returns 409; deleting a completed job
+  does not allow replay of that identity.
+- SQL mode adds `orchestrator_submissions` automatically; file mode uses the
+  existing shared-data volume. Include this table/directory in backups. No existing
+  jobs or artifacts are rewritten. Older clients retain their existing behaviour.
+- Validation: 214 tests passed; PostgreSQL integration is a separate opt-in check.
+
 ## Unreleased - 2026-08-10
 
 ### Summary

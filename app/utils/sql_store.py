@@ -18,6 +18,8 @@ queue=Table('orchestrator_queue',metadata,
 organization=Table('orchestrator_organization',metadata,
     Column('id',String(40),primary_key=True),Column('payload',document,nullable=False))
 schema=Table('orchestrator_schema',metadata,Column('version',Integer,primary_key=True))
+submissions=Table('orchestrator_submissions',metadata,
+    Column('id',String(64),primary_key=True),Column('payload',document,nullable=False))
 
 def enabled():return bool(settings.JOB_DATABASE_URL)
 
