@@ -45,8 +45,6 @@ class Settings(BaseSettings):
     EXECUTION_CLIENTS_FILE: str | None = None
     EXECUTION_LEGACY_OWNER: str | None = None
     EXECUTION_PIN_IMAGES: bool = False
-    TRAINING_CATALOG_URL: str | None = None
-    TRAINING_CATALOG_TOKEN: str | None = None
     JOB_TRACK_FILE: str = os.path.join(VM_SHARED_DATA, "job_track.json")
     JOBS_DIR: str = os.path.join(VM_SHARED_DATA, "jobs")
     DATASETS_DIR: str = os.path.join(VM_SHARED_DATA, "datasets")
@@ -132,11 +130,6 @@ class Settings(BaseSettings):
         "gustavo.jorge@energaize.io": "Gustavo Nuno Chaves Jorge",
     }
 
-    MONGO_USER: str = "runtimeUI"
-    MONGO_PASSWORD: str = "runtimeUIDB"
-    MONGO_HOST: str = "193.136.62.78"
-    MONGO_PORT: int = 27017
-    MONGO_AUTH_SOURCE: str = "admin"
     ACCEPTABLE_GAP_IN_MINUTES: int = 60
 
     BUILDING_DATASET_CSV_HEADER: ClassVar[dict[str, str]] = {
@@ -252,12 +245,6 @@ class Settings(BaseSettings):
             return parsed
         return value
 
-    def mongo_uri(self, db_name: str) -> str:
-        return (
-            f"mongodb://{self.MONGO_USER}:{self.MONGO_PASSWORD}"
-            f"@{self.MONGO_HOST}:{self.MONGO_PORT}/{db_name}"
-            f"?authSource={self.MONGO_AUTH_SOURCE}"
-        )
 
 
 settings = Settings()

@@ -10,7 +10,6 @@ from app.api.router import api_router
 from app.config import settings
 from app.utils.job_utils import ensure_directories
 from app.version import __version__
-from app.api.catalog_compat import forward_catalog
 
 
 @asynccontextmanager
@@ -35,7 +34,6 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="OPEVA Job Orchestrator", version=__version__, lifespan=lifespan)
-app.middleware('http')(forward_catalog)
 
 app.add_middleware(
     CORSMiddleware,

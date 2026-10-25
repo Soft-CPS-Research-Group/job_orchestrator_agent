@@ -22,7 +22,7 @@ def test_health_endpoint(monkeypatch, tmp_path):
 
 
 def test_app_version_metadata():
-    assert __version__ == "1.4.0"
+    assert __version__ == "1.5.0"
     assert app.version == __version__
 
 
@@ -51,17 +51,6 @@ def test_job_orchestrator_exposes_expected_routes():
         "/ops/jobs/{job_id}/stop",
         "/ops/queue/cleanup",
         "/ops/jobs/cleanup",
-        "/experiment-config/create",
-        "/experiment-configs",
-        "/experiment-config/{file_name}",
-        "/dataset",
-        "/datasets/generate",
-        "/dataset/sites",
-        "/dataset/dates-available/{site_id}",
-        "/datasets",
-        "/dataset/download/{name}",
-        "/dataset/upload",
-        "/dataset/{name}",
         "/simulation-data/index",
         "/simulation-data/file",
     }
@@ -69,3 +58,10 @@ def test_job_orchestrator_exposes_expected_routes():
     actual = {route.path for route in app.routes}
 
     assert expected <= actual
+
+
+def test_catalog_is_owned_only_by_training():
+    client = TestClient(app)
+    for path in ["/datasets", "/dataset/sites", "/experiment-configs", "/dataset/download/example"]:
+        assert client.get(path).status_code == 404
+    assert client.post("/dataset", json={}).status_code == 404

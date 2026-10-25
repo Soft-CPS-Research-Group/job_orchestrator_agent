@@ -765,39 +765,8 @@ def test_ops_requeue_endpoint(api_client, monkeypatch):
     assert data["status"] == JobStatus.QUEUED.value
 
 
-def test_experiment_config_yaml_endpoints(api_client):
-    create = api_client.post(
-        "/experiment-config/create",
-        json={"file_name": "api-config.yaml", "yaml_content": "experiment:\n  name: api-test\n"},
-    )
-    assert create.status_code == 200
-    assert create.json()["file"] == "api-config.yaml"
-
-    get_resp = api_client.get("/experiment-config/api-config.yaml")
-    assert get_resp.status_code == 200
-    assert "experiment:" in get_resp.text
-    assert get_resp.headers["content-type"].startswith("text/yaml")
-
-    update = api_client.put(
-        "/experiment-config/api-config.yaml",
-        json={"yaml_content": "experiment:\n  name: api-test-updated\n"},
-    )
-    assert update.status_code == 200
-    assert update.json()["message"] == "Config updated"
-
-    delete = api_client.delete("/experiment-config/api-config.yaml")
-    assert delete.status_code == 200
 
 
-def test_experiment_config_invalid_yaml_returns_422(api_client):
-    bad = api_client.post(
-        "/experiment-config/create",
-        json={"file_name": "bad.yaml", "yaml_content": "experiment: [\n"},
-    )
-    assert bad.status_code == 422
-    detail = bad.json().get("detail", "")
-    assert "Invalid YAML" in detail
-    assert "line" in detail.lower()
 
 
 def test_hosts_include_active_job_ids_and_current_job(api_client, monkeypatch):

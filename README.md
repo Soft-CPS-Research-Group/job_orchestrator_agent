@@ -1,6 +1,6 @@
 # OPEVA Job Orchestrator
 
-FastAPI service that owns OPEVA simulation job orchestration and job datasets. It validates and stores job configs, persists job metadata and artefacts on the shared NFS volume, dispatches work to worker agents, tracks heartbeats/status, and exposes datasets/logs/results/progress.
+FastAPI service that owns job submission, queues, dispatch, status and result access. Production job records and queues live in the dedicated Orchestrator PostgreSQL database. Input snapshots, resolved execution configurations and artifacts live on persistent shared storage. AI Training owns workspaces, dataset generation/catalogs and experiment configurations, accessed through its authenticated workspace API.
 
 The public API keeps the contracts that previously lived in `opeva_backend_api_training`; only the base service/port changes.
 
@@ -35,8 +35,6 @@ Job clients use this service for:
 - `/job-images/versions`
 - `/deucalion/partitions`
 - `/experiment-config*`
-- `/dataset`, `/datasets`, `/datasets/generate`, `/dataset/upload`, `/dataset/download/{name}`
-- `/dataset/sites`, `/dataset/dates-available/{site_id}`
 - `/simulation-data/index`, `/simulation-data/file`
 
 Worker agents use:
@@ -49,7 +47,7 @@ Operator endpoints live under `/ops/*`.
 
 ## Postman
 
-Import [`postman/OPEVA Job Orchestrator.postman_collection.json`](postman/OPEVA%20Job%20Orchestrator.postman_collection.json) to exercise the migrated job, dataset, config, worker-agent, ops and simulation-data endpoints. The collection defaults to `http://localhost:8011`.
+Import [`postman/OPEVA Job Orchestrator.postman_collection.json`](postman/OPEVA%20Job%20Orchestrator.postman_collection.json) to exercise the job, worker-agent, ops and simulation-data endpoints. The collection defaults to `http://localhost:8011`.
 
 ## Releases
 
@@ -111,7 +109,6 @@ Common environment variables:
 | `JOB_EMAIL_NOTIFY_STATUSES` | `queued,dispatched,running,stop_requested,finished,failed,stopped,canceled` | Job statuses that trigger emails. |
 | `JOB_EMAIL_SUBMITTER_EMAILS` | Tiago/Codex to `calof@isep.ipp.pt`; Pedro to `1211076@isep.ipp.pt`; Gustavo to `1211061@isep.ipp.pt` | Submitter-to-recipient map used in job status emails. Accepts JSON or `name=email,name2=email2`. |
 | `JOB_EMAIL_SUBMITTER_NAMES` | Codex, Pedro and Gustavo aliases | Submitter display-name aliases used in job metadata and emails. |
-| `MONGO_*` | existing OPEVA defaults | Mongo connection used by dataset generation. |
 
 ## Development
 
@@ -130,3 +127,7 @@ The GitHub Actions workflow runs tests and builds/pushes Docker images. The defa
 Reuse it only for retries of the same logical request. A successful new run needs
 another key. Identity is scoped to workspace and submitter; conflicting parameters
 return 409. The original resolved input survives retries and restarts.
+
+## Catalog boundary (1.5.0)
+
+The former `/dataset*` and `/experiment-config*` endpoints and catalog proxy have been removed. Use authenticated AI Training workspace routes under `/api/training/workspaces/{wid}/bridge`. The UI already uses these routes. The Orchestrator neither connects to MongoDB nor generates or edits catalog datasets. Historical job/result endpoints remain available for existing Training job links; they are execution interfaces, not a second catalog.
