@@ -13,6 +13,16 @@ permissions:
 jobs:
   tests:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: isolated-ci
+          POSTGRES_DB: orchestrator_source
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -24,6 +34,14 @@ jobs:
           pip install -e '.[test]'
       - name: Run tests
         run: pytest
+      - name: PostgreSQL queue and migration (mandatory)
+        env:
+          TEST_JOB_DATABASE_URL: postgresql+psycopg2://postgres:isolated-ci@127.0.0.1:5432/orchestrator_source
+          TEST_TRANSFER_DATABASE_URL: postgresql+psycopg2://postgres:isolated-ci@127.0.0.1:5432/orchestrator_target
+          PGPASSWORD: isolated-ci
+        run: |
+          createdb -h 127.0.0.1 -U postgres orchestrator_target
+          pytest tests/test_database_transfer.py tests/test_postgres_store.py
 
   docker:
     needs: tests
