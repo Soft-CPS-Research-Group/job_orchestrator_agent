@@ -34,7 +34,6 @@ Job clients use this service for:
 - `/job-resolved-config/{job_id}`
 - `/job-images/versions`
 - `/deucalion/partitions`
-- `/experiment-config*`
 - `/simulation-data/index`, `/simulation-data/file`
 
 Worker agents use:
