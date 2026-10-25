@@ -24,6 +24,7 @@ class JobLaunchRequest(BaseModel):
     workspace_id: Optional[str] = Field(default=None, max_length=100)
     idempotency_key: Optional[str] = Field(default=None, min_length=8, max_length=160)
     training_context: Optional[Dict] = None
+    execution: Optional[Dict] = None
     config: Optional[Dict] = None
     config_path: Optional[str] = None
     target_host: Optional[str] = None

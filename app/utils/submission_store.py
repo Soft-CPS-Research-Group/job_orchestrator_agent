@@ -18,6 +18,8 @@ def digest(value):
 
 
 def identity(request):
+    if request.execution:
+        return digest([request.execution['client_id'], request.execution['namespace'], request.idempotency_key])
     return digest([request.workspace_id or 'laboratory', request.submitted_by or '', request.idempotency_key])
 
 

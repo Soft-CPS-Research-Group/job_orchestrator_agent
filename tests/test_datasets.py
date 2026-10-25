@@ -2,20 +2,15 @@ import os
 import io
 import json
 import zipfile
-import importlib
 import pytest
-import sys
 from pathlib import Path
 
 @pytest.fixture
 def dataset_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("VM_SHARED_DATA", str(tmp_path))
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import app.config as config
-    importlib.reload(config)
-    config.settings.DATASETS_DIR = os.path.join(config.settings.VM_SHARED_DATA, "datasets")
+    monkeypatch.setattr(config.settings, "VM_SHARED_DATA", str(tmp_path))
+    monkeypatch.setattr(config.settings, "DATASETS_DIR", str(tmp_path / "datasets"))
     from app.utils import file_utils
-    importlib.reload(file_utils)
     return file_utils, config.settings
 
 def test_list_datasets_returns_description(dataset_env):

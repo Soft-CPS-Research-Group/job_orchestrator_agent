@@ -15,6 +15,8 @@ router = APIRouter()
 async def run_sim(request: JobLaunchRequest, x_training_token: str | None = Header(None)):
     from app.config import settings
     import hmac
+    if request.execution:
+        raise HTTPException(400, "Execution identity is assigned by the versioned API")
     if request.workspace_id and request.workspace_id != "laboratory" and settings.TRAINING_SERVICE_TOKEN:
         if not hmac.compare_digest(x_training_token or "", settings.TRAINING_SERVICE_TOKEN):
             raise HTTPException(403, "Scoped submissions require the Training service")
@@ -51,12 +53,16 @@ async def stop_job(job_id: str):
 
 @router.get("/jobs")
 async def list_jobs(workspace_id: str | None = None):
-    return job_controller.list_jobs(workspace_id)
+    return [row for row in job_controller.list_jobs(workspace_id)
+            if not row.get('job_meta', {}).get('execution') and not row.get('job_info', {}).get('execution')]
 
 
 @router.get("/queue")
 async def list_queue():
-    return job_controller.list_queue()
+    from app.services import job_service
+    job_service._refresh_jobs()
+    return [row for row in job_controller.list_queue()
+            if not job_service.jobs.get(row['job_id'], {}).get('execution')]
 
 @router.get("/job-info/{job_id}")
 async def job_info(job_id: str):

@@ -36,6 +36,8 @@ def create_dataset(
     until_ts: str = None,
     seconds_per_time_step: int | None = None,
 ):
+    if name.startswith('execution_'):
+        raise HTTPException(400, 'Reserved execution input name')
     payload = file_utils.create_dataset_dir(
         name,
         site_id,
@@ -127,6 +129,8 @@ def create_datasets_from_mongo(
         site_id = str(site["site_id"])
         buildings = [str(building) for building in site.get("buildings", [])]
         dataset_name = _automatic_dataset_name(name_prefix, site_id)
+        if dataset_name.startswith('execution_'):
+            raise HTTPException(400, 'Reserved execution input name')
         resolved_config = _with_all_buildings_selected(citylearn_configs, buildings)
         item = {
             "site_id": site_id,

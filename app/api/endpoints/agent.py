@@ -5,6 +5,13 @@ from app.models.agent import NextJobRequest, StatusRequest, HeartbeatRequest, Wo
 
 router = APIRouter()
 
+
+@router.get("/api/agent/status/{job_id}")
+def execution_status(job_id: str):
+    # Same trusted worker control plane as heartbeat/dispatch/status updates.
+    from app.controllers import job_controller
+    return job_controller.get_status(job_id)
+
 @router.post("/api/agent/next-job")
 def next_job(req: NextJobRequest):
     job = agent_controller.next_job(req)

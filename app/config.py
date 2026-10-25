@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     CONFIGS_DIR: str = os.path.join(VM_SHARED_DATA, "configs")
     JOB_DATABASE_URL: str | None = None
     TRAINING_SERVICE_TOKEN: str | None = None
+    EXECUTION_CLIENTS_FILE: str | None = None
+    EXECUTION_LEGACY_OWNER: str | None = None
+    EXECUTION_PIN_IMAGES: bool = False
+    TRAINING_CATALOG_URL: str | None = None
+    TRAINING_CATALOG_TOKEN: str | None = None
     JOB_TRACK_FILE: str = os.path.join(VM_SHARED_DATA, "job_track.json")
     JOBS_DIR: str = os.path.join(VM_SHARED_DATA, "jobs")
     DATASETS_DIR: str = os.path.join(VM_SHARED_DATA, "datasets")

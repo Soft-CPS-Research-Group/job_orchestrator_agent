@@ -1923,6 +1923,9 @@ def _can_dispatch_to_worker(
         return True
 
     meta = jobs.get(job_id) or {}
+    pinned_images = (meta.get('execution') or {}).get('images')
+    if pinned_images is not None and worker_id not in pinned_images:
+        return False
     if meta.get('artifact_isolation_enabled') and not supports_artifact_isolation:
         return False
     if meta.get("attempt_fencing_enabled") is True and not supports_attempt_fencing:
@@ -2995,6 +2998,9 @@ async def launch_simulation(request: JobLaunchRequest):
             raise HTTPException(409, 'This submission key already has different parameters')
         if not record:
             frozen = request.model_dump(mode='json')
+            if request.execution and settings.EXECUTION_PIN_IMAGES:
+                from app.services.execution_images import freeze
+                frozen['execution']['images'] = freeze(request)
             if request.config_path:
                 relative = Path(request.config_path.removeprefix('configs/'))
                 root = Path(settings.CONFIGS_DIR).resolve()
@@ -3043,6 +3049,10 @@ async def _launch_simulation(request: JobLaunchRequest, job_id: str | None = Non
         with open(os.path.join(settings.CONFIGS_DIR, relative_path)) as f:
             config = yaml.safe_load(f)
         config_path = relative_path
+    elif request.config and request.execution:
+        # Executor-owned configuration is not published in the legacy catalog.
+        config_path = f"jobs/{job_id}/config.resolved.yaml"
+        config = request.config
     elif request.config:
         file_name = request.save_as or f"{job_id}.yaml"
         file_name = _safe_filename(file_name)
@@ -3081,7 +3091,7 @@ async def _launch_simulation(request: JobLaunchRequest, job_id: str | None = Non
     if _is_union_worker(preferred_host):
         _validate_union_image_tag_available(image_tag)
 
-    if not config_path.startswith("configs/"):
+    if not request.execution and not config_path.startswith("configs/"):
         config_path = f"configs/{config_path}"
 
     os.makedirs(_log_dir(job_id), exist_ok=True)
@@ -3095,6 +3105,7 @@ async def _launch_simulation(request: JobLaunchRequest, job_id: str | None = Non
         "job_id": job_id,
         "workspace_id": request.workspace_id or "laboratory",
         "training_context": request.training_context or {},
+        "execution": request.execution or {},
         "job_name": job_name,
         "config_path": config_path,
         "target_host": preferred_host,
@@ -3130,7 +3141,7 @@ async def _launch_simulation(request: JobLaunchRequest, job_id: str | None = Non
     if os.path.exists(info_path):
         with open(info_path) as handle:
             launch_info = json.load(handle)
-    launch_info.update(workspace_id=meta["workspace_id"], training_context=meta["training_context"])
+    launch_info.update(workspace_id=meta["workspace_id"], training_context=meta["training_context"], execution=meta["execution"])
     with open(info_path, "w") as handle:
         json.dump(launch_info, handle, indent=2)
     _write_status(
@@ -4274,6 +4285,16 @@ def _dispatch_claimed_job(
         _LOGGER.warning("Skipping job %s with status %s (queue entry likely stale)", job_id, status_now)
         return None
 
+    execution = meta.get('execution') or {}
+    if execution.get('inputs'):
+        from app.services.execution_inputs import verify
+        try:
+            for reference in execution['inputs']:
+                verify({'id': execution['client_id']}, reference)
+        except HTTPException:
+            _write_status(job_id, JobStatus.FAILED.value, {'error': 'immutable_input_unavailable'})
+            return None
+
     config_path = meta.get("config_path")
     job_name = meta.get("job_name", job_id)
 
@@ -4298,6 +4319,11 @@ def _dispatch_claimed_job(
     command = f"--config {CONTAINER_DATA_ROOT}/{runtime_config_path} --job_id {job_id}"
     requested_image_tag = _normalize_image_tag(meta.get("image_tag"))
     dispatch_image, dispatch_image_tag = _resolve_job_image_for_worker(worker_id, requested_image_tag)
+    pinned_images = (meta.get('execution') or {}).get('images')
+    if pinned_images is not None:
+        if worker_id not in pinned_images:
+            raise HTTPException(409, 'No frozen image for this worker')
+        dispatch_image = pinned_images[worker_id]
 
     next_attempt_number = int(meta.get("attempt_number", 0) or 0) + 1
     attempt_token = secrets.token_urlsafe(32) if supports_attempt_fencing else None
