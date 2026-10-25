@@ -116,7 +116,10 @@ def artifact_path(job_id, relative):
     path = root / relative
     if Path(relative).is_absolute() or '..' in Path(relative).parts or not path.resolve().is_relative_to(root):
         raise HTTPException(400, 'Invalid artifact path')
-    if Path(relative).parts[0] not in {'bundle', 'results', 'progress', 'logs', 'config.resolved.yaml'}:
+    if not Path(relative).parts or Path(relative).parts[0] not in {
+        'bundle', 'results', 'progress', 'logs', 'checkpoints', 'onnx_models',
+        'models', 'artifact_manifest.json', 'config.resolved.yaml',
+    }:
         raise HTTPException(404, 'Artifact not found')
     if not path.is_file():
         raise HTTPException(404, 'Artifact not found')
@@ -127,8 +130,8 @@ def artifact_path(job_id, relative):
 def artifacts(job_id: str):
     root = Path(settings.JOBS_DIR) / job_id
     files = []
-    candidates = [root / 'config.resolved.yaml']
-    for folder in ('bundle', 'results', 'progress', 'logs'):
+    candidates = [root / 'config.resolved.yaml', root / 'artifact_manifest.json']
+    for folder in ('bundle', 'results', 'progress', 'logs', 'checkpoints', 'onnx_models', 'models'):
         candidates.extend((root / folder).rglob('*'))
     for candidate in sorted(candidates):
         if not candidate.is_file():
